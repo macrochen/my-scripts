@@ -1,0 +1,26 @@
+# Mac
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints
+
+# Node / JS
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
