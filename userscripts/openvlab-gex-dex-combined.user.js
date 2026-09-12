@@ -360,8 +360,10 @@
                 let maxCallGex = -Infinity, callWall = null;
                 let minPutGex = Infinity, putWall = null;
                 let exactGexFlipPoint = null, minGexFlipDist = Infinity;
+                let exactDexFlipPoint = null, minDexFlipDist = Infinity;
                 
                 let prevNetGex = null, prevStrike = null;
+                let prevNetDex = null, prevDexStrike = null;
                 let totalNetDex = 0;
 
                 sortedData.forEach(item => {
@@ -396,6 +398,19 @@
                     }
                     prevNetGex = nGexB;
                     prevStrike = item.strike;
+
+                    if (prevNetDex !== null && prevDexStrike !== null) {
+                        if ((prevNetDex < 0 && nDexB > 0) || (prevNetDex > 0 && nDexB < 0)) {
+                            let calculatedFlip = prevDexStrike - prevNetDex * (item.strike - prevDexStrike) / (nDexB - prevNetDex);
+                            let distToSpot = Math.abs(calculatedFlip - spotPrice);
+                            if (distToSpot < minDexFlipDist) {
+                                minDexFlipDist = distToSpot;
+                                exactDexFlipPoint = calculatedFlip;
+                            }
+                        }
+                    }
+                    prevNetDex = nDexB;
+                    prevDexStrike = item.strike;
                     totalNetDex += nDexB;
 
                     labels.push(item.strike);
@@ -454,7 +469,7 @@
                             tooltip: { callbacks: { label: function(c) { let v = c.raw.toFixed(4); return `${c.dataset.label}: ${v > 0 && c.datasetIndex===0?'+':''}${v} 亿`; }}},
                             verticalLines: [
                                 { val: spotPrice, color: 'rgba(59, 130, 246, 0.8)', text: '现价', yOffset: 15, textColor: '#60a5fa' },
-                                { val: exactGexFlipPoint, color: 'rgba(251, 191, 36, 0.8)', text: '中性点', yOffset: 32, textColor: '#fcd34d' }
+                                { val: exactDexFlipPoint, color: 'rgba(251, 191, 36, 0.8)', text: '中性点', yOffset: 32, textColor: '#fcd34d' }
                             ]
                         })
                     })
