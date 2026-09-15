@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         预期波动计算器 (OpenVlab 全品种自适应版)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  自动解析 OpenVlab T型报价表虚拟列表(Virtual List)，提取现价与期限并计算预期波动
+// @version      3.2
+// @description  自动解析 OpenVlab T型报价表虚拟列表，通过结构特征提取现价与期限并计算预期波动
 // @match        *://*.openvlab.cn/*
 // @updateURL    https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/openvlab-expected-move-calculator.user.js
 // @downloadURL  https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/openvlab-expected-move-calculator.user.js
@@ -30,6 +30,16 @@
             moveDownMoney,
             daysToExpiry
         };
+    }
+
+    // 嗅探结构特征：返回满足 3列布局 且 中间列是数字 的行元素
+    function getValidOptionRows() {
+        return Array.from(document.querySelectorAll('div')).filter(el => {
+            if (el.children.length !== 3) return false;
+            const strikeText = el.children[1].innerText.trim();
+            // 行权价必须是纯数字或带小数点的数字
+            return /^\d+\.\d+$/.test(strikeText) || /^\d+$/.test(strikeText);
+        });
     }
 
     function createFloatingUI() {
@@ -110,7 +120,7 @@
                 let price = 0;
                 let daysToExpiry = 0;
 
-                // 1. 自动提取标的现价 (精准锁定T型表下方的买卖盘中心价)
+                // 1. 自动提取标的现价
                 const buyMatch = pageText.match(/买价\s*([\d,\.]+)/);
                 const sellMatch = pageText.match(/卖价\s*([\d,\.]+)/);
                 if (buyMatch && sellMatch) {
@@ -124,11 +134,10 @@
                 }
                 if (!price || isNaN(price)) throw new Error("缺少标的价格，计算中止。");
 
-                // 2. 自动提取当前激活的剩余天数 (利用 URL 中的合约代号去匹配文本)
+                // 2. 自动提取当前激活的剩余天数
                 const urlMatch = window.location.href.match(/(\d{4})(?=\?|$)/);
                 if (urlMatch) {
                     const contractCode = urlMatch[1];
-                    // 构造正则寻找类似于 "2609 49天" 或 "2608 主 26天" 的文本
                     const dayRegex = new RegExp(`${contractCode}[^\\d]*(\\d+)\\s*天`);
                     const dayMatch = pageText.match(dayRegex);
                     if (dayMatch) {
@@ -141,24 +150,15 @@
                 }
                 if (!daysToExpiry || isNaN(daysToExpiry)) throw new Error("缺少剩余天数，计算中止。");
 
-                // 3. 动态嗅探虚拟列表 (Virtual List) 的数据行
-                const rows = Array.from(document.querySelectorAll('div[data-react-window-index]'));
-                if (rows.length === 0) throw new Error("未能定位到行情数据行 (data-react-window-index)，请确认页面已完全加载，且处于 T型报价 视图。");
+                // 3. 动态嗅探数据行 (基于特征嗅探，脱离对特定 class 或 dataset 属性的依赖)
+                const rows = getValidOptionRows();
+                if (rows.length === 0) throw new Error("未能通过结构特征定位到行情数据行，请确认页面已完全加载。");
 
                 let atmStrike = 0, minStrikeDiff = Infinity;
                 let callIv = NaN, putIv = NaN;
 
                 rows.forEach(row => {
-                    // 确保是包含期权数据的行 (分为看涨、行权价、看跌 三部分)
-                    if (row.children.length < 3) return;
-
-                    const callGrid = row.children[0].querySelector('.grid');
                     const strikeDiv = row.children[1];
-                    const putGrid = row.children[2].querySelector('.grid');
-
-                    if (!callGrid || !putGrid || !strikeDiv) return;
-
-                    // 提取行权价
                     const rowStrike = parseFloat(strikeDiv.innerText.trim());
                     if (isNaN(rowStrike)) return;
 
@@ -169,12 +169,13 @@
                         minStrikeDiff = strikeDiff;
                         atmStrike = rowStrike;
 
-                        // 提取隐波 (OpenVlab的隐波列带有 .italic 类名，且有 text-[var(--vlab-iv)] 属性)
-                        const callIvEl = callGrid.querySelector('.italic');
-                        const putIvEl = putGrid.querySelector('.italic');
+                        // 无视内部 DOM 嵌套层级，直接提取两边的全量纯文本并按空格拆分
+                        const callTextArr = row.children[0].innerText.trim().split(/\s+/);
+                        const putTextArr = row.children[2].innerText.trim().split(/\s+/);
 
-                        if (callIvEl) callIv = parseFloat(callIvEl.innerText.replace('%', '').trim());
-                        if (putIvEl) putIv = parseFloat(putIvEl.innerText.replace('%', '').trim());
+                        // 文本流位置提取：看涨隐波列在最左（首个数据），看跌隐波在最右（末个数据）
+                        if (callTextArr.length > 0) callIv = parseFloat(callTextArr[0].replace('%', ''));
+                        if (putTextArr.length > 0) putIv = parseFloat(putTextArr[putTextArr.length - 1].replace('%', ''));
                     }
                 });
 
@@ -182,7 +183,7 @@
                     throw new Error("表格数据提取失败，无法找到有效的行权价数据。");
                 }
                 if (isNaN(callIv) || isNaN(putIv) || callIv === 0) {
-                    throw new Error(`找到了平值行权价(${atmStrike})，但未找到隐波数据！请确保右上角「列配置」中已开启「隐波」列。`);
+                    throw new Error(`找到了平值行权价(${atmStrike})，但基于位置提取隐波失败，请确认页面列排版未发生颠覆性改变，且开启了「隐波」列。`);
                 }
 
                 const res = calculateExpectedMove(price, callIv, putIv, daysToExpiry);
@@ -235,10 +236,14 @@
                     low: targetLowStrike
                 };
 
+                // 更新高亮边界的轮询器
                 if (!window.__emCalcInterval) {
                     window.__emCalcInterval = setInterval(() => {
                         if (!window.__emCalcHighlight) return;
-                        const vRows = document.querySelectorAll('div[data-react-window-index]');
+                        
+                        // 同样使用结构特征嗅探器，抛弃特定的 data 属性
+                        const vRows = getValidOptionRows();
+                        
                         vRows.forEach(row => {
                             if (row.children.length >= 3) {
                                 const strikeDiv = row.children[1];
