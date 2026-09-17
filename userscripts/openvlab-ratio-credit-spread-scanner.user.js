@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         比例信用价差扫描器 (1:3 利润优先修正版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  基于 OpenVlab Canvas/React 实时数据，全量扫描 Delta < 0.2 且买入腿成本在 40%-60% 之间的最优 1:3 比例价差组合
 // @match        *://*.openvlab.cn/*
 // @updateURL    https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/openvlab-ratio-credit-spread-scanner.user.js
@@ -343,32 +343,32 @@
                     window.addEventListener('scroll', updateRcsHighlightBoxes, true);
                 }
 
-                if (bestCallCombo) {
-                    const c = bestCallCombo;
-                    const breakEven = c.short.strike + (c.netCredit + c.short.strike - c.long.strike) / 2;
-                    html += `
-                        <div style="margin-bottom:12px; padding:10px; border-left: 3px solid #ef4444; background: rgba(239, 68, 68, 0.08); border-radius: 4px;">
-                            <div style="color:#ef4444; font-weight:bold; margin-bottom:4px; font-size:13px;">🐻 看涨比例价差 (做空上方)</div>
-                            <div>买入 1手 @ <span style="font-family:monospace; font-weight:bold;">${c.long.strike}</span> (花费 ${c.long.callAsk.toFixed(4)})</div>
-                            <div>卖出 3手 @ <span style="font-family:monospace; font-weight:bold;">${c.short.strike}</span> (Delta: ${c.short.callDelta.toFixed(3)}, 收入 ${(3 * c.short.callBid).toFixed(4)})</div>
-                            <div><strong>净权利金:</strong> <span style="color:#34d399; font-weight:bold;">+${c.netCredit.toFixed(4)}</span> <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(c.ratio*100).toFixed(0)}%)</span></div>
-                            <div><strong>保护位/最大利润点:</strong> ${c.short.strike}</div>
-                            <div style="color:#f87171; font-weight:bold; margin-top:4px;">💀 真实止损线 (Breakeven): ${breakEven.toFixed(4)}</div>
-                        </div>
-                    `;
-                }
-
                 if (bestPutCombo) {
                     const p = bestPutCombo;
                     const breakEven = p.short.strike - (p.netCredit + p.long.strike - p.short.strike) / 2;
                     html += `
-                        <div style="margin-bottom:8px; padding:10px; border-left: 3px solid #10b981; background: rgba(16, 185, 129, 0.08); border-radius: 4px;">
-                            <div style="color:#10b981; font-weight:bold; margin-bottom:4px; font-size:13px;">🐂 看跌比例价差 (做多下方)</div>
+                        <div style="margin-bottom:12px; padding:10px; border-left: 3px solid #10b981; background: rgba(16, 185, 129, 0.08); border-radius: 4px;">
+                            <div style="color:#10b981; font-weight:bold; margin-bottom:4px; font-size:13px;">🐂 看跌比例价差 (做多下方 Put)</div>
                             <div>买入 1手 @ <span style="font-family:monospace; font-weight:bold;">${p.long.strike}</span> (花费 ${p.long.putAsk.toFixed(4)})</div>
                             <div>卖出 3手 @ <span style="font-family:monospace; font-weight:bold;">${p.short.strike}</span> (Delta: ${p.short.putDelta.toFixed(3)}, 收入 ${(3 * p.short.putBid).toFixed(4)})</div>
                             <div><strong>净权利金:</strong> <span style="color:#34d399; font-weight:bold;">+${p.netCredit.toFixed(4)}</span> <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(p.ratio*100).toFixed(0)}%)</span></div>
                             <div><strong>保护位/最大利润点:</strong> ${p.short.strike}</div>
                             <div style="color:#34d399; font-weight:bold; margin-top:4px;">💀 真实止损线 (Breakeven): ${breakEven.toFixed(4)}</div>
+                        </div>
+                    `;
+                }
+
+                if (bestCallCombo) {
+                    const c = bestCallCombo;
+                    const breakEven = c.short.strike + (c.netCredit + c.short.strike - c.long.strike) / 2;
+                    html += `
+                        <div style="margin-bottom:8px; padding:10px; border-left: 3px solid #ef4444; background: rgba(239, 68, 68, 0.08); border-radius: 4px;">
+                            <div style="color:#ef4444; font-weight:bold; margin-bottom:4px; font-size:13px;">🐻 看涨比例价差 (做空上方 Call)</div>
+                            <div>买入 1手 @ <span style="font-family:monospace; font-weight:bold;">${c.long.strike}</span> (花费 ${c.long.callAsk.toFixed(4)})</div>
+                            <div>卖出 3手 @ <span style="font-family:monospace; font-weight:bold;">${c.short.strike}</span> (Delta: ${c.short.callDelta.toFixed(3)}, 收入 ${(3 * c.short.callBid).toFixed(4)})</div>
+                            <div><strong>净权利金:</strong> <span style="color:#34d399; font-weight:bold;">+${c.netCredit.toFixed(4)}</span> <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(c.ratio*100).toFixed(0)}%)</span></div>
+                            <div><strong>保护位/最大利润点:</strong> ${c.short.strike}</div>
+                            <div style="color:#f87171; font-weight:bold; margin-top:4px;">💀 真实止损线 (Breakeven): ${breakEven.toFixed(4)}</div>
                         </div>
                     `;
                 }
