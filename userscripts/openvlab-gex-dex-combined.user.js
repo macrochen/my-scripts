@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenVlab GEX & DEX 双分布图 (期权卖方视角版)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  将 GEX 与 DEX 合二为一，左右同屏展示，并提供基于期权卖方的深度策略解读。
+// @version      2.0
+// @description  基于 OpenVlab Canvas/React 实时数据，自动提取全量 Gamma、Delta、OI 并生成 GEX 与 DEX 合并看板
 // @match        *://*.openvlab.cn/*
 // @require      https://cdn.jsdelivr.net/npm/chart.js
 // @grant        none
@@ -23,7 +23,7 @@
         if (spotInput) {
             spotInput.value = '';
             spotInput.style.backgroundColor = '#7f1d1d';
-            setTimeout(() => { spotInput.style.backgroundColor = '#4b5563'; }, 800);
+            setTimeout(() => { spotInput.style.backgroundColor = '#374151'; }, 800);
         }
         if (gexChartInstance) { gexChartInstance.destroy(); gexChartInstance = null; }
         if (dexChartInstance) { dexChartInstance.destroy(); dexChartInstance = null; }
@@ -47,6 +47,105 @@
         }
     }, 500);
 
+    /**
+     * 从 OpenVlab 的 React Fiber 树中提取底层实时行情数据快照
+     */
+    function extractVlabGdexData() {
+        const canvas = document.querySelector('canvas');
+        if (!canvas) {
+            throw new Error("页面上未找到行情 Canvas 元素，请确认处于 T 型报价页面且行情已加载。");
+        }
+
+        const fiberKey = Object.keys(canvas).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        if (!fiberKey || !canvas[fiberKey]) {
+            throw new Error("未侦测到 React Fiber 节点，请刷新页面后重试。");
+        }
+
+        let cur = canvas[fiberKey];
+        let tableProps = null;
+
+        while (cur) {
+            if (cur.memoizedProps) {
+                const p = cur.memoizedProps;
+                if (p.source && typeof p.source.getSnapshot === 'function') {
+                    tableProps = p;
+                    break;
+                }
+                if (p.rows && Array.isArray(p.rows)) {
+                    tableProps = p;
+                }
+            }
+            cur = cur.return;
+        }
+
+        if (!tableProps || !tableProps.source) {
+            throw new Error("未能定位到行情数据源 (source.getSnapshot)，请确认页面渲染完成。");
+        }
+
+        const snapshot = tableProps.source.getSnapshot();
+        if (!snapshot) {
+            throw new Error("获取行情数据快照失败。");
+        }
+
+        // 提取标的现价
+        let spotPrice = 0;
+        if (snapshot.underlyingQuote) {
+            const uq = snapshot.underlyingQuote;
+            spotPrice = uq.value || uq.last || ((uq.bid && uq.ask) ? (uq.bid + uq.ask) / 2 : 0);
+        }
+        if (!spotPrice || isNaN(spotPrice)) {
+            const buyMatch = document.body.innerText.match(/买价\s*([\d,\.]+)/);
+            const sellMatch = document.body.innerText.match(/卖价\s*([\d,\.]+)/);
+            if (buyMatch && sellMatch) {
+                spotPrice = (parseFloat(buyMatch[1].replace(/,/g, '')) + parseFloat(sellMatch[1].replace(/,/g, ''))) / 2;
+            }
+        }
+
+        const rawRows = snapshot.staticRows || tableProps.rows || [];
+        if (!rawRows || rawRows.length === 0) {
+            throw new Error("行情数据表中未发现行权价数据 (rows 为空)。");
+        }
+
+        const quotes = snapshot.quotesByCode || {};
+        const parsedRows = [];
+
+        rawRows.forEach((item, index) => {
+            const rowData = item.row || item;
+            const strike = parseFloat(rowData.strike);
+            if (isNaN(strike)) return;
+
+            const callQuote = quotes[rowData.callCode] || {};
+            const putQuote = quotes[rowData.putCode] || {};
+
+            const callGamma = parseFloat(callQuote.gamma);
+            const callDelta = parseFloat(callQuote.delta);
+            const callOI = parseFloat(callQuote.oi);
+
+            const putGamma = parseFloat(putQuote.gamma);
+            const putDelta = parseFloat(putQuote.delta);
+            const putOI = parseFloat(putQuote.oi);
+
+            parsedRows.push({
+                strike: strike,
+                callGamma: isNaN(callGamma) ? 0 : callGamma,
+                callDelta: isNaN(callDelta) ? 0 : callDelta,
+                callOI: isNaN(callOI) ? 0 : callOI,
+                putGamma: isNaN(putGamma) ? 0 : putGamma,
+                putDelta: isNaN(putDelta) ? 0 : putDelta,
+                putOI: isNaN(putOI) ? 0 : putOI
+            });
+        });
+
+        if (parsedRows.length === 0) {
+            throw new Error("未能提取到有效的期权行权价数据。");
+        }
+
+        return {
+            spotPrice,
+            rows: parsedRows
+        };
+    }
+
     function createFloatingUI() {
         if (document.getElementById('gdex-vlab-container')) return;
 
@@ -54,8 +153,9 @@
         container.id = 'gdex-vlab-container';
         container.style.cssText = `
             position: fixed; top: 40px; left: 40px; z-index: 99999;
-            font-family: Arial, sans-serif; box-shadow: 0 4px 24px rgba(0,0,0,0.8);
-            border-radius: 8px; background: #181a1b; color: #d1d5db;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            box-shadow: 0 8px 28px rgba(0,0,0,0.6);
+            border-radius: 10px; background: #18191c; color: #d1d5db;
             border: 1px solid #374151; width: 1100px;
             max-height: 95vh; display: flex; flex-direction: column;
         `;
@@ -66,13 +166,13 @@
             font-size: 14px; font-weight: bold; cursor: move;
             display: flex; justify-content: space-between; align-items: center;
             user-select: none; border-bottom: 1px solid #1f2937; flex-shrink: 0;
-            border-radius: 7px 7px 0 0;
+            border-radius: 9px 9px 0 0;
         `;
         header.innerHTML = `
-            <span>📊 OpenVlab GEX & DEX 卖方决策看板</span>
+            <span>📊 OpenVlab GEX & DEX 卖方决策看板 (v2.0)</span>
             <div>
-                <span id="gdex-help-toggle" style="cursor:pointer; padding: 2px 8px; font-size: 13px; color: #fbbf24; border: 1px solid #fbbf24; border-radius: 4px; margin-right: 12px; background: rgba(0,0,0,0.2);">📖 怎么看?</span>
-                <span id="gdex-toggle" style="cursor:pointer; padding: 0 4px; font-size: 16px;">□</span>
+                <span id="gdex-help-toggle" style="cursor:pointer; padding: 2px 8px; font-size: 12px; color: #fbbf24; border: 1px solid #fbbf24; border-radius: 4px; margin-right: 12px; background: rgba(0,0,0,0.2);">📖 怎么看?</span>
+                <span id="gdex-toggle" style="cursor:pointer; padding: 0 4px; font-size: 16px;" title="展开/折叠">□</span>
             </div>
         `;
 
@@ -142,37 +242,32 @@
             helpPanel.style.display = helpPanel.style.display === 'none' ? 'block' : 'none';
         });
 
-        const inputStyle = "width: 50px; background:#374151; color:white; border:1px solid #4b5563; border-radius:4px; padding:4px; text-align:center; font-size: 12px; transition: background-color 0.3s;";
+        const inputStyle = "width: 70px; background:#374151; color:white; border:1px solid #4b5563; border-radius:4px; padding:4px 8px; text-align:center; font-size: 12px; transition: background-color 0.3s;";
 
         const configArea = document.createElement('div');
-        configArea.style.cssText = 'margin-bottom: 16px; font-size: 13px; background: rgba(0,0,0,0.3); padding: 12px; border-radius: 6px; border: 1px solid #374151;';
+        configArea.style.cssText = 'margin-bottom: 14px; font-size: 13px; background: rgba(0,0,0,0.25); padding: 10px 14px; border-radius: 6px; border: 1px solid #374151;';
         configArea.innerHTML = `
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                <div style="display: flex; align-items: center; font-weight: bold;">
-                    <span style="color:#fbbf24; margin-right: 8px;">⚙️ 数据列配置</span>
-                    <span style="color:#9ca3af; font-size: 11px; font-weight: normal;">(以行权价为中轴向两侧数的列数)</span>
-                </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
                 <div style="display: flex; align-items: center;">
-                    <span style="margin-right: 12px;">标的价格: 
-                        <input type="number" id="gdex-spot" value="" placeholder="自动抓取" step="0.001" style="${inputStyle} width:80px; margin-left: 4px;">
-                        <button id="btn-sync-spot" style="margin-left: 4px; background: #4f46e5; color: white; border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px;">🔄 同步</button>
+                    <span style="color:#fbbf24; margin-right: 12px; font-weight: bold;">⚡ 实时参数配置:</span>
+                    <span style="margin-right: 16px;">标的价格: 
+                        <input type="number" id="gdex-spot" value="" placeholder="自动提取" step="0.001" style="${inputStyle} width:85px; margin-left: 4px;">
+                        <button id="btn-sync-spot" style="margin-left: 6px; background: #4f46e5; color: white; border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px;">🔄 同步现价</button>
                     </span>
-                    <span>合约乘数: <input type="number" id="gdex-multiplier" value="10000" step="1" style="${inputStyle} width:70px;"></span>
+                    <span>合约乘数: <input type="number" id="gdex-multiplier" value="10000" step="1" style="${inputStyle}"></span>
                 </div>
-            </div>
-            <div style="display: flex; gap: 20px; border-top: 1px solid #4b5563; padding-top: 10px;">
-                <span style="color:#d1d5db;">OI 列数: <input type="number" id="gdex-oi" value="7" style="${inputStyle}"></span>
-                <span style="color:#d1d5db;">Delta 列数: <input type="number" id="gdex-delta" value="1" style="${inputStyle}"></span>
-                <span style="color:#d1d5db;">Gamma 列数: <input type="number" id="gdex-gamma" value="9" style="${inputStyle}"></span>
+                <div style="color: #9ca3af; font-size: 11px;">
+                    ✨ Gamma、Delta、OI 已由底层数据源原生自动解析
+                </div>
             </div>
         `;
 
         const button = document.createElement('button');
-        button.innerText = '⚡ 抓取当前可见数据并生成合并看板';
+        button.innerText = '⚡ 一键生成全量 GEX & DEX 看板';
         button.style.cssText = `
-            width: 100%; padding: 12px; background: linear-gradient(90deg, #059669 0%, #2563eb 100%); color: white;
+            width: 100%; padding: 11px; background: linear-gradient(90deg, #059669 0%, #2563eb 100%); color: white;
             border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 14px;
-            margin-bottom: 16px; transition: opacity 0.2s; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            margin-bottom: 14px; transition: opacity 0.2s; flex-shrink: 0; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
         `;
         button.onmouseover = () => button.style.opacity = '0.9';
         button.onmouseout = () => button.style.opacity = '1';
@@ -201,26 +296,15 @@
 
         configArea.querySelector('#btn-sync-spot').addEventListener('click', () => {
             const spotInput = document.getElementById('gdex-spot');
-            let foundPrice = null;
-            const rows = Array.from(document.querySelectorAll('div[data-react-window-index]')).filter(r => r.offsetParent !== null);
-            for (let row of rows) {
-                const rowText = row.innerText || '';
-                const spotMatch = rowText.match(/(?:买价|卖价|最新价|标的)\s*[:：]?\s*(\d+\.\d+)/);
-                if (spotMatch && spotMatch[1]) { foundPrice = parseFloat(spotMatch[1]); break; }
-            }
-            if (!foundPrice) {
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-                let node;
-                while (node = walker.nextNode()) {
-                    if (node.parentElement && node.parentElement.offsetParent === null) continue;
-                    const match = node.nodeValue.trim().match(/(?:买价|卖价|最新价|标的)\s*[:：]?\s*(\d+\.\d+)/);
-                    if (match) { foundPrice = parseFloat(match[1]); break; }
+            try {
+                const data = extractVlabGdexData();
+                if (data.spotPrice) {
+                    spotInput.value = data.spotPrice;
+                    spotInput.style.backgroundColor = '#065f46';
+                    setTimeout(() => { spotInput.style.backgroundColor = '#374151'; }, 800);
                 }
-            }
-            if (foundPrice && !isNaN(foundPrice)) {
-                spotInput.value = foundPrice;
-                spotInput.style.backgroundColor = '#065f46';
-                setTimeout(() => { spotInput.style.backgroundColor = '#374151'; }, 800);
+            } catch (e) {
+                console.warn(e);
             }
         });
 
@@ -279,74 +363,23 @@
 
                 const spotInput = document.getElementById('gdex-spot');
                 const multiplier = parseFloat(document.getElementById('gdex-multiplier').value);
-                const oiOffset = parseInt(document.getElementById('gdex-oi').value);
-                const deltaOffset = parseInt(document.getElementById('gdex-delta').value);
-                const gammaOffset = parseInt(document.getElementById('gdex-gamma').value);
 
-                let autoFoundPrice = null;
-                const visibleRows = Array.from(document.querySelectorAll('div[data-react-window-index]')).filter(r => r.offsetParent !== null);
-
-                for (let row of visibleRows) {
-                    const rowText = row.innerText || '';
-                    const spotMatch = rowText.match(/(?:买价|卖价|最新价|标的)\s*[:：]?\s*(\d+\.\d+)/);
-                    if (spotMatch && spotMatch[1]) { autoFoundPrice = parseFloat(spotMatch[1]); break; }
-                }
-                if (!autoFoundPrice) {
-                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-                    let node;
-                    while (node = walker.nextNode()) {
-                        if (node.parentElement && node.parentElement.offsetParent === null) continue;
-                        const match = node.nodeValue.trim().match(/(?:买价|卖价|最新价|标的)\s*[:：]?\s*(\d+\.\d+)/);
-                        if (match) { autoFoundPrice = parseFloat(match[1]); break; }
-                    }
+                const data = extractVlabGdexData();
+                if (!spotInput.value && data.spotPrice) {
+                    spotInput.value = data.spotPrice;
                 }
 
-                if (autoFoundPrice && !isNaN(autoFoundPrice)) {
-                    spotInput.value = autoFoundPrice;
+                let spotPrice = parseFloat(spotInput.value) || data.spotPrice;
+                if (!spotPrice || isNaN(spotPrice)) {
+                    spotPrice = parseFloat(prompt("未能自动识别现价，请输入标的现价：", "1.700"));
+                    if (spotPrice && !isNaN(spotPrice)) spotInput.value = spotPrice;
                 }
 
-                let spotPrice = parseFloat(spotInput.value);
-
-                if (isNaN(spotPrice)) throw new Error("无法抓取标的价格，请手动填写。");
+                if (isNaN(spotPrice)) throw new Error("无法获取标的价格，请手动填写。");
                 if (isNaN(multiplier)) throw new Error("请输入有效的合约乘数。");
-                if (isNaN(oiOffset) || isNaN(deltaOffset) || isNaN(gammaOffset)) throw new Error("列序设置不正确。");
 
-                if (visibleRows.length === 0) throw new Error("未检测到数据，请确保已加载期权链。");
-
-                visibleRows.forEach(row => {
-                    if (row.children.length < 3) return;
-                    const strikeDiv = row.children[1];
-                    if (!strikeDiv) return;
-
-                    const strikeText = strikeDiv.innerText.replace(/[%$,]/g, '').trim();
-                    if (strikeText.includes('买价') || strikeText.includes('卖价')) return;
-
-                    const strike = parseFloat(strikeText);
-                    if (isNaN(strike)) return;
-
-                    const callGrid = row.children[0].querySelector('.grid');
-                    const putGrid = row.children[2].querySelector('.grid');
-                    if (!callGrid || !putGrid) return;
-
-                    const callLen = callGrid.children.length;
-
-                    const parseCell = (grid, idx) => {
-                        if (idx < 0 || idx >= grid.children.length || !grid.children[idx]) return NaN;
-                        const text = grid.children[idx].innerText.replace(/[%$,]/g, '').trim();
-                        return text === '-' || text === '' ? NaN : parseFloat(text);
-                    };
-
-                    const callGamma = parseCell(callGrid, callLen - gammaOffset);
-                    const callOI = parseCell(callGrid, callLen - oiOffset);
-                    const callDelta = parseCell(callGrid, callLen - deltaOffset);
-                    
-                    const putGamma = parseCell(putGrid, gammaOffset - 1);
-                    const putOI = parseCell(putGrid, oiOffset - 1);
-                    const putDelta = parseCell(putGrid, deltaOffset - 1);
-
-                    if (!isNaN(callGamma) && !isNaN(callOI) && !isNaN(putGamma) && !isNaN(putOI) && !isNaN(callDelta) && !isNaN(putDelta)) {
-                        cachedData.set(strike, { strike, callGamma, callOI, putGamma, putOI, callDelta, putDelta });
-                    }
+                data.rows.forEach(item => {
+                    cachedData.set(item.strike, item);
                 });
 
                 if (cachedData.size === 0) throw new Error("提取失败：未找到完整数据，请确认页面已开启 Delta, Gamma 和 OI。");
