@@ -293,6 +293,104 @@
                 const targetHighStrike = getConservativeStrike(res.expectedHigh, true);
                 const targetLowStrike = getConservativeStrike(res.expectedLow, false);
 
+                // --- 渲染与同步高亮方框 (Call上界红色，Put下界绿色) ---
+                window.__emCalcHighlight = {
+                    high: targetHighStrike,
+                    low: targetLowStrike
+                };
+
+                function updateHighlightBoxes() {
+                    const highlight = window.__emCalcHighlight;
+                    if (!highlight) return;
+
+                    const canvas = document.querySelector('canvas');
+                    if (!canvas) return;
+
+                    const strikeHeader = Array.from(document.querySelectorAll('*'))
+                        .find(el => el.children.length === 0 && el.innerText?.trim() === '行权价');
+                    if (!strikeHeader) return;
+
+                    const fiberKey = Object.keys(canvas).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+                    if (!fiberKey || !canvas[fiberKey]) return;
+
+                    let cur = canvas[fiberKey];
+                    let rows = null;
+                    while (cur) {
+                        if (cur.memoizedProps && cur.memoizedProps.rows) {
+                            rows = cur.memoizedProps.rows;
+                            break;
+                        }
+                        cur = cur.return;
+                    }
+                    if (!rows || rows.length === 0) return;
+
+                    const canvasRect = canvas.getBoundingClientRect();
+                    const strikeRect = strikeHeader.getBoundingClientRect();
+                    const rowHeight = canvasRect.height / rows.length;
+
+                    // 找出 Call 上界和 Put 下界对应的行索引
+                    let highRowIndex = -1, lowRowIndex = -1;
+                    let minHighDiff = Infinity, minLowDiff = Infinity;
+
+                    rows.forEach((item, idx) => {
+                        const rowData = item.row || item;
+                        const strike = parseFloat(rowData.strike);
+                        if (isNaN(strike)) return;
+
+                        const diffHigh = Math.abs(strike - highlight.high);
+                        if (diffHigh < minHighDiff) {
+                            minHighDiff = diffHigh;
+                            highRowIndex = idx;
+                        }
+
+                        const diffLow = Math.abs(strike - highlight.low);
+                        if (diffLow < minLowDiff) {
+                            minLowDiff = diffLow;
+                            lowRowIndex = idx;
+                        }
+                    });
+
+                    function renderBox(id, rowIndex, color) {
+                        if (rowIndex === -1) return;
+                        let box = document.getElementById(id);
+                        if (!box) {
+                            box = document.createElement('div');
+                            box.id = id;
+                            box.className = 'em-calc-highlight-box';
+                            document.body.appendChild(box);
+                        }
+                        const top = canvasRect.top + window.scrollY + rowIndex * rowHeight;
+                        const left = strikeRect.left + window.scrollX;
+                        box.style.cssText = `
+                            position: absolute;
+                            left: ${left}px;
+                            top: ${top}px;
+                            width: ${strikeRect.width}px;
+                            height: ${rowHeight}px;
+                            border: 2px solid ${color};
+                            border-radius: 4px;
+                            pointer-events: none;
+                            box-sizing: border-box;
+                            z-index: 999;
+                            background: ${color}22;
+                            box-shadow: 0 0 8px ${color}88;
+                            transition: top 0.15s ease, left 0.15s ease;
+                        `;
+                    }
+
+                    // Call 上界: 红色方框；Put 下界: 绿色方框
+                    renderBox('em-box-call-high', highRowIndex, '#ef4444');
+                    renderBox('em-box-put-low', lowRowIndex, '#10b981');
+                }
+
+                updateHighlightBoxes();
+
+                if (!window.__emCalcInterval) {
+                    window.__emCalcInterval = setInterval(updateHighlightBoxes, 200);
+                    window.addEventListener('resize', updateHighlightBoxes);
+                    window.addEventListener('scroll', updateHighlightBoxes, true);
+                }
+
                 const priceDecimals = data.price > 500 ? 1 : (data.price > 10 ? 2 : 3);
 
                 resultBox.style.display = 'block';
