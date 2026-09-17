@@ -241,6 +241,108 @@
                 resultBox.style.display = 'block';
                 let html = '';
 
+                // 保存当前选中的行权价用于高亮
+                window.__rcsHighlight = {
+                    callLong: bestCallCombo ? bestCallCombo.long.strike : null,
+                    callShort: bestCallCombo ? bestCallCombo.short.strike : null,
+                    putLong: bestPutCombo ? bestPutCombo.long.strike : null,
+                    putShort: bestPutCombo ? bestPutCombo.short.strike : null
+                };
+
+                function updateRcsHighlightBoxes() {
+                    const highlight = window.__rcsHighlight;
+                    if (!highlight) return;
+
+                    const canvas = document.querySelector('canvas');
+                    if (!canvas) return;
+
+                    const strikeHeader = Array.from(document.querySelectorAll('*'))
+                        .find(el => el.children.length === 0 && el.innerText?.trim() === '行权价');
+                    if (!strikeHeader) return;
+
+                    const fiberKey = Object.keys(canvas).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+                    if (!fiberKey || !canvas[fiberKey]) return;
+
+                    let cur = canvas[fiberKey];
+                    let rows = null;
+                    while (cur) {
+                        if (cur.memoizedProps && cur.memoizedProps.rows) {
+                            rows = cur.memoizedProps.rows;
+                            break;
+                        }
+                        cur = cur.return;
+                    }
+                    if (!rows || rows.length === 0) return;
+
+                    const canvasRect = canvas.getBoundingClientRect();
+                    const strikeRect = strikeHeader.getBoundingClientRect();
+                    const rowHeight = canvasRect.height / rows.length;
+
+                    function findRowIndex(targetStrike) {
+                        if (targetStrike === null || targetStrike === undefined) return -1;
+                        let bestIdx = -1, minDiff = Infinity;
+                        rows.forEach((item, idx) => {
+                            const rowData = item.row || item;
+                            const strike = parseFloat(rowData.strike);
+                            if (isNaN(strike)) return;
+                            const diff = Math.abs(strike - targetStrike);
+                            if (diff < minDiff && diff < 0.001) {
+                                minDiff = diff;
+                                bestIdx = idx;
+                            }
+                        });
+                        return bestIdx;
+                    }
+
+                    function renderBox(id, rowIndex, color, isDashed) {
+                        let box = document.getElementById(id);
+                        if (rowIndex === -1) {
+                            if (box) box.remove();
+                            return;
+                        }
+                        if (!box) {
+                            box = document.createElement('div');
+                            box.id = id;
+                            box.className = 'rcs-highlight-box';
+                            document.body.appendChild(box);
+                        }
+                        const top = canvasRect.top + window.scrollY + rowIndex * rowHeight;
+                        const left = strikeRect.left + window.scrollX;
+                        const borderStyle = isDashed ? 'dashed' : 'solid';
+                        box.style.cssText = `
+                            position: absolute;
+                            left: ${left}px;
+                            top: ${top}px;
+                            width: ${strikeRect.width}px;
+                            height: ${rowHeight}px;
+                            border: 2px ${borderStyle} ${color};
+                            border-radius: 4px;
+                            pointer-events: none;
+                            box-sizing: border-box;
+                            z-index: 999;
+                            background: ${color}22;
+                            box-shadow: 0 0 8px ${color}88;
+                            transition: top 0.15s ease, left 0.15s ease;
+                        `;
+                    }
+
+                    // Call 组合用红色：虚线表示买入腿，实线表示卖出3手腿
+                    renderBox('rcs-box-call-long', findRowIndex(highlight.callLong), '#ef4444', true);
+                    renderBox('rcs-box-call-short', findRowIndex(highlight.callShort), '#ef4444', false);
+
+                    // Put 组合用绿色：虚线表示买入腿，实线表示卖出3手腿
+                    renderBox('rcs-box-put-long', findRowIndex(highlight.putLong), '#10b981', true);
+                    renderBox('rcs-box-put-short', findRowIndex(highlight.putShort), '#10b981', false);
+                }
+
+                updateRcsHighlightBoxes();
+
+                if (!window.__rcsInterval) {
+                    window.__rcsInterval = setInterval(updateRcsHighlightBoxes, 200);
+                    window.addEventListener('resize', updateRcsHighlightBoxes);
+                    window.addEventListener('scroll', updateRcsHighlightBoxes, true);
+                }
+
                 if (bestCallCombo) {
                     const c = bestCallCombo;
                     const breakEven = c.short.strike + (c.netCredit + c.short.strike - c.long.strike) / 2;
