@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenVlab GEX & DEX 双分布图 (期权卖方视角版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  基于 OpenVlab Canvas/React 实时数据，自动提取全量 Gamma、Delta、OI 并生成 GEX 与 DEX 合并看板
 // @match        *://*.openvlab.cn/*
 // @require      https://cdn.jsdelivr.net/npm/chart.js
@@ -149,6 +149,9 @@
     function createFloatingUI() {
         if (document.getElementById('gdex-vlab-container')) return;
 
+        const EXPANDED_WIDTH = '1100px';
+        const COLLAPSED_WIDTH = '367px'; // 1100px 的 1/3
+
         const container = document.createElement('div');
         container.id = 'gdex-vlab-container';
         container.style.cssText = `
@@ -156,8 +159,9 @@
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
             box-shadow: 0 8px 28px rgba(0,0,0,0.6);
             border-radius: 10px; background: #18191c; color: #d1d5db;
-            border: 1px solid #374151; width: 1100px;
+            border: 1px solid #374151; width: ${COLLAPSED_WIDTH};
             max-height: 95vh; display: flex; flex-direction: column;
+            transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         `;
 
         const header = document.createElement('div');
@@ -165,20 +169,21 @@
             padding: 10px 16px; background: linear-gradient(90deg, #047857 0%, #4338ca 100%); color: white;
             font-size: 14px; font-weight: bold; cursor: move;
             display: flex; justify-content: space-between; align-items: center;
-            user-select: none; border-bottom: 1px solid #1f2937; flex-shrink: 0;
-            border-radius: 9px 9px 0 0;
+            user-select: none; border-bottom: none; flex-shrink: 0;
+            border-radius: 9px; box-sizing: border-box;
+            transition: border-radius 0.25s ease;
         `;
         header.innerHTML = `
-            <span>📊 OpenVlab GEX & DEX 卖方决策看板 (v2.0)</span>
-            <div>
-                <span id="gdex-help-toggle" style="cursor:pointer; padding: 2px 8px; font-size: 12px; color: #fbbf24; border: 1px solid #fbbf24; border-radius: 4px; margin-right: 12px; background: rgba(0,0,0,0.2);">📖 怎么看?</span>
-                <span id="gdex-toggle" style="cursor:pointer; padding: 0 4px; font-size: 16px;" title="展开/折叠">□</span>
+            <span style="flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px;" title="📊 OpenVlab GEX & DEX 卖方决策看板 (v2.1)">📊 OpenVlab GEX & DEX 卖方决策看板 (v2.1)</span>
+            <div style="display: flex; align-items: center; flex-shrink: 0;">
+                <span id="gdex-help-toggle" style="cursor:pointer; padding: 2px 8px; font-size: 12px; color: #fbbf24; border: 1px solid #fbbf24; border-radius: 4px; margin-right: 10px; background: rgba(0,0,0,0.2);">📖 怎么看?</span>
+                <span id="gdex-toggle" style="cursor:pointer; padding: 0 4px; font-size: 16px; line-height: 1;" title="展开/折叠">□</span>
             </div>
         `;
 
         let isDragging = false, currentX = 0, currentY = 0, initialX = 0, initialY = 0, xOffset = 0, yOffset = 0;
         const dragStart = (e) => {
-            if (e.target.tagName === 'SPAN' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+            if (e.target.closest('#gdex-toggle') || e.target.closest('#gdex-help-toggle') || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
             if (e.type === "touchstart") {
                 initialX = e.touches[0].clientX - xOffset; initialY = e.touches[0].clientY - yOffset;
             } else {
@@ -210,10 +215,30 @@
         contentBox.id = 'gdex-content';
         contentBox.style.cssText = 'padding: 16px; display: none; overflow-y: auto; flex-grow: 1;';
 
-        header.querySelector('#gdex-toggle').addEventListener('click', (e) => {
+        const toggleBtn = header.querySelector('#gdex-toggle');
+        const setCollapsed = (collapsed) => {
+            if (collapsed) {
+                container.style.width = COLLAPSED_WIDTH;
+                header.style.borderRadius = '9px';
+                header.style.borderBottom = 'none';
+                contentBox.style.display = 'none';
+                toggleBtn.innerText = '□';
+            } else {
+                container.style.width = EXPANDED_WIDTH;
+                header.style.borderRadius = '9px 9px 0 0';
+                header.style.borderBottom = '1px solid #1f2937';
+                contentBox.style.display = 'block';
+                toggleBtn.innerText = '—';
+                setTimeout(() => {
+                    if (gexChartInstance) gexChartInstance.resize();
+                    if (dexChartInstance) dexChartInstance.resize();
+                }, 260);
+            }
+        };
+
+        toggleBtn.addEventListener('click', () => {
             const isHidden = contentBox.style.display === 'none';
-            contentBox.style.display = isHidden ? 'block' : 'none';
-            e.target.innerText = isHidden ? '—' : '□';
+            setCollapsed(!isHidden);
         });
 
         const helpPanel = document.createElement('div');
@@ -239,7 +264,12 @@
         `;
 
         header.querySelector('#gdex-help-toggle').addEventListener('click', () => {
-            helpPanel.style.display = helpPanel.style.display === 'none' ? 'block' : 'none';
+            if (contentBox.style.display === 'none') {
+                setCollapsed(false);
+                helpPanel.style.display = 'block';
+            } else {
+                helpPanel.style.display = helpPanel.style.display === 'none' ? 'block' : 'none';
+            }
         });
 
         const inputStyle = "width: 70px; background:#374151; color:white; border:1px solid #4b5563; border-radius:4px; padding:4px 8px; text-align:center; font-size: 12px; transition: background-color 0.3s;";
