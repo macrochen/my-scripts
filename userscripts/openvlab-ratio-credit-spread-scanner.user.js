@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         比例信用价差扫描器 (1:3 利润优先修正版)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  基于 Delta < 0.2 且买入腿成本在 40%-60% 之间，优先选取净收入最高的组合
+// @version      2.0
+// @description  基于 OpenVlab Canvas/React 实时数据，全量扫描 Delta < 0.2 且买入腿成本在 40%-60% 之间的最优 1:3 比例价差组合
 // @match        *://*.openvlab.cn/*
 // @updateURL    https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/openvlab-ratio-credit-spread-scanner.user.js
 // @downloadURL  https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/openvlab-ratio-credit-spread-scanner.user.js
@@ -12,6 +12,89 @@
 (function() {
     'use strict';
 
+    /**
+     * 从 OpenVlab 的 React Fiber 树中提取全部期权行与实时行情快照
+     */
+    function extractVlabOptionsData() {
+        const canvas = document.querySelector('canvas');
+        if (!canvas) {
+            throw new Error("页面上未找到行情 Canvas 元素，请确认处于 T 型报价页面且行情已加载。");
+        }
+
+        const fiberKey = Object.keys(canvas).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        if (!fiberKey || !canvas[fiberKey]) {
+            throw new Error("未侦测到 React Fiber 节点，请刷新页面后重试。");
+        }
+
+        let cur = canvas[fiberKey];
+        let tableProps = null;
+
+        while (cur) {
+            if (cur.memoizedProps) {
+                const p = cur.memoizedProps;
+                if (p.source && typeof p.source.getSnapshot === 'function') {
+                    tableProps = p;
+                    break;
+                }
+                if (p.rows && Array.isArray(p.rows)) {
+                    tableProps = p;
+                }
+            }
+            cur = cur.return;
+        }
+
+        if (!tableProps || !tableProps.source) {
+            throw new Error("未能定位到行情数据源 (source.getSnapshot)，请确认页面渲染完成。");
+        }
+
+        const snapshot = tableProps.source.getSnapshot();
+        if (!snapshot) {
+            throw new Error("获取行情数据快照失败。");
+        }
+
+        const rawRows = snapshot.staticRows || tableProps.rows || [];
+        if (!rawRows || rawRows.length === 0) {
+            throw new Error("行情数据表中未发现行权价数据 (rows 为空)。");
+        }
+
+        const quotes = snapshot.quotesByCode || {};
+        const optionsData = [];
+
+        rawRows.forEach((item, index) => {
+            const rowData = item.row || item;
+            const strike = parseFloat(rowData.strike);
+            if (isNaN(strike)) return;
+
+            const callQuote = quotes[rowData.callCode] || {};
+            const putQuote = quotes[rowData.putCode] || {};
+
+            const callAsk = parseFloat(callQuote.ask);
+            const callBid = parseFloat(callQuote.bid);
+            const callDelta = parseFloat(callQuote.delta);
+
+            const putAsk = parseFloat(putQuote.ask);
+            const putBid = parseFloat(putQuote.bid);
+            const putDelta = parseFloat(putQuote.delta);
+
+            optionsData.push({
+                rowIndex: index,
+                strike: strike,
+                callAsk: isNaN(callAsk) ? 0 : callAsk,
+                callBid: isNaN(callBid) ? 0 : callBid,
+                callDelta: isNaN(callDelta) ? 0 : callDelta,
+                putAsk: isNaN(putAsk) ? 0 : putAsk,
+                putBid: isNaN(putBid) ? 0 : putBid,
+                putDelta: isNaN(putDelta) ? 0 : putDelta
+            });
+        });
+
+        if (optionsData.length === 0) {
+            throw new Error("未能提取到有效的期权行情与 Greeks 数据。");
+        }
+
+        return optionsData;
+    }
+
     function createFloatingUI() {
         if (document.getElementById('rcs-calc-container')) return;
 
@@ -19,19 +102,20 @@
         container.id = 'rcs-calc-container';
         container.style.cssText = `
             position: fixed; bottom: 30px; left: 30px; z-index: 99999;
-            font-family: Arial, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            border-radius: 8px; background: #181a1b; color: #d1d5db;
-            border: 1px solid #374151; width: 320px; overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            border-radius: 10px; background: #18191c; color: #d1d5db;
+            border: 1px solid #374151; width: 330px; overflow: hidden; font-size: 13px;
         `;
 
         const header = document.createElement('div');
         header.style.cssText = `
-            padding: 8px 12px; background: #991b1b; color: #fecaca;
+            padding: 9px 14px; background: #991b1b; color: #fecaca;
             font-size: 13px; font-weight: bold; cursor: move;
             display: flex; justify-content: space-between; align-items: center;
             user-select: none; border-bottom: 1px solid #7f1d1d;
         `;
-        header.innerHTML = `<span>比例价差猎手 (1:3 利润版)</span><span id="rcs-calc-toggle" style="cursor:pointer; padding: 0 4px;" title="展开/折叠">□</span>`;
+        header.innerHTML = `<span>⚡ 比例价差猎手 (1:3 利润版 v2.0)</span><span id="rcs-calc-toggle" style="cursor:pointer; padding: 0 4px; font-size: 14px;" title="展开/折叠">□</span>`;
 
         let isDragging = false;
         let currentX = 0, currentY = 0, initialX = 0, initialY = 0, xOffset = 0, yOffset = 0;
@@ -59,7 +143,7 @@
 
         const contentBox = document.createElement('div');
         contentBox.id = 'rcs-calc-content';
-        contentBox.style.cssText = 'padding: 16px; display: none;';
+        contentBox.style.cssText = 'padding: 14px; display: none;';
 
         header.querySelector('#rcs-calc-toggle').addEventListener('click', (e) => {
             if (contentBox.style.display === 'none') {
@@ -71,118 +155,89 @@
             }
         });
 
-        const warnText = document.createElement('div');
-        warnText.style.cssText = 'font-size: 11px; color: #fbbf24; margin-bottom: 10px; line-height: 1.4;';
-        warnText.innerText = "⚠️ 提示：请先上下滚动期权链，确保深虚值(Delta<0.2)合约已加载到页面中再计算。";
-
         const button = document.createElement('button');
-        button.innerText = '扫描合规策略组合';
+        button.innerText = '一键扫描最优策略组合';
         button.style.cssText = `
-            width: 100%; padding: 10px; background: #dc2626; color: white;
-            border: none; border-radius: 4px; cursor: pointer; font-weight: bold;
-            margin-bottom: 10px; transition: background 0.2s;
+            width: 100%; padding: 9px; background: #dc2626; color: white;
+            border: none; border-radius: 6px; cursor: pointer; font-weight: bold;
+            margin-bottom: 10px; transition: background 0.2s; font-size: 13px;
         `;
         button.onmouseover = () => button.style.background = '#b91c1c';
         button.onmouseout = () => button.style.background = '#dc2626';
 
         const resultBox = document.createElement('div');
-        resultBox.style.cssText = 'font-size: 12px; line-height: 1.6; display: none; margin-top: 10px;';
+        resultBox.style.cssText = 'font-size: 12px; line-height: 1.6; display: none; margin-top: 6px;';
 
         button.addEventListener('click', () => {
             try {
-                const rows = Array.from(document.querySelectorAll('div[data-react-window-index]'));
-                if (rows.length === 0) throw new Error("未能定位到行情数据，请处于 T型报价 视图。");
-
-                let optionsData = [];
-
-                rows.forEach(row => {
-                    if (row.children.length < 3) return;
-
-                    const callGrid = row.children[0].querySelector('.grid');
-                    const strikeDiv = row.children[1];
-                    const putGrid = row.children[2].querySelector('.grid');
-                    if (!callGrid || !putGrid || !strikeDiv) return;
-
-                    const strike = parseFloat(strikeDiv.innerText.trim());
-                    if (isNaN(strike)) return;
-
-                    const extractNums = (grid) => {
-                        return Array.from(grid.children).map(c => {
-                            const match = c.innerText.match(/[-]?\d+\.\d+/);
-                            return match ? parseFloat(match[0]) : NaN;
-                        }).filter(n => !isNaN(n));
-                    };
-
-                    const callNums = extractNums(callGrid);
-                    const putNums = extractNums(putGrid);
-
-                    if (callNums.length >= 3 && putNums.length >= 3) {
-                        optionsData.push({
-                            strike: strike,
-                            callAsk: callNums[callNums.length - 3],
-                            callBid: callNums[callNums.length - 2],
-                            callDelta: callNums[callNums.length - 1],
-                            putDelta: putNums[0],
-                            putBid: putNums[1],
-                            putAsk: putNums[2]
-                        });
-                    }
-                });
-
-                if (optionsData.length === 0) throw new Error("无法提取价格/Delta，请检查列配置。");
+                const optionsData = extractVlabOptionsData();
                 optionsData.sort((a, b) => a.strike - b.strike);
 
                 let validCallCombos = [];
                 let validPutCombos = [];
 
-                // 2. 核心推演：筛选看涨比例价差 (Call)
+                // 1. 核心推演：筛选看涨比例价差 (Call: 买近卖远)
                 for (let i = 0; i < optionsData.length; i++) {
                     const shortLeg = optionsData[i];
-                    // 卖出腿铁律：Delta < 0.20
-                    if (Math.abs(shortLeg.callDelta) >= 0.20) continue;
+                    // 卖出腿：Delta < 0.20 且 Bid > 0
+                    if (Math.abs(shortLeg.callDelta) >= 0.20 || shortLeg.callBid <= 0) continue;
 
                     for (let j = 0; j < i; j++) {
                         const longLeg = optionsData[j];
+                        if (longLeg.callAsk <= 0) continue;
+
                         const totalCredit = 3 * shortLeg.callBid;
                         const netCredit = totalCredit - longLeg.callAsk;
 
                         if (netCredit > 0) {
                             const spendRatio = longLeg.callAsk / totalCredit;
-                            // 容忍度：买入腿花费占总收入的 40% 到 60% 之间
+                            // 买入腿花费占总收入的 40% 到 60% 之间
                             if (spendRatio >= 0.4 && spendRatio <= 0.6) {
-                                validCallCombos.push({ short: shortLeg, long: longLeg, netCredit: netCredit, ratio: spendRatio });
+                                validCallCombos.push({
+                                    short: shortLeg,
+                                    long: longLeg,
+                                    netCredit: netCredit,
+                                    ratio: spendRatio
+                                });
                             }
                         }
                     }
                 }
 
-                // 3. 核心推演：筛选看跌比例价差 (Put)
+                // 2. 核心推演：筛选看跌比例价差 (Put: 买近卖远)
                 for (let i = optionsData.length - 1; i >= 0; i--) {
                     const shortLeg = optionsData[i];
-                    if (Math.abs(shortLeg.putDelta) >= 0.20) continue;
+                    if (Math.abs(shortLeg.putDelta) >= 0.20 || shortLeg.putBid <= 0) continue;
 
                     for (let j = optionsData.length - 1; j > i; j--) {
                         const longLeg = optionsData[j];
+                        if (longLeg.putAsk <= 0) continue;
+
                         const totalCredit = 3 * shortLeg.putBid;
                         const netCredit = totalCredit - longLeg.putAsk;
 
                         if (netCredit > 0) {
                             const spendRatio = longLeg.putAsk / totalCredit;
                             if (spendRatio >= 0.4 && spendRatio <= 0.6) {
-                                validPutCombos.push({ short: shortLeg, long: longLeg, netCredit: netCredit, ratio: spendRatio });
+                                validPutCombos.push({
+                                    short: shortLeg,
+                                    long: longLeg,
+                                    netCredit: netCredit,
+                                    ratio: spendRatio
+                                });
                             }
                         }
                     }
                 }
 
-                // 按净权利金从大到小排序，优先展示利润最大的组合（自然逼近 Delta 0.2）
+                // 净权利金从大到小排序，优先展示利润最大的组合
                 validCallCombos.sort((a, b) => b.netCredit - a.netCredit);
                 validPutCombos.sort((a, b) => b.netCredit - a.netCredit);
 
                 const bestCallCombo = validCallCombos.length > 0 ? validCallCombos[0] : null;
                 const bestPutCombo = validPutCombos.length > 0 ? validPutCombos[0] : null;
 
-                // 4. 渲染结果
+                // 3. 渲染结果
                 resultBox.style.display = 'block';
                 let html = '';
 
@@ -190,11 +245,11 @@
                     const c = bestCallCombo;
                     const breakEven = c.short.strike + (c.netCredit + c.short.strike - c.long.strike) / 2;
                     html += `
-                        <div style="margin-bottom:12px; padding:8px; border-left: 3px solid #ef4444; background: rgba(239, 68, 68, 0.1);">
-                            <div style="color:#ef4444; font-weight:bold; margin-bottom:4px;">🐻 看涨比例价差 (做空上方)</div>
-                            <div>买入 1手 @ ${c.long.strike} (花费 ${c.long.callAsk.toFixed(4)})</div>
-                            <div>卖出 3手 @ ${c.short.strike} (Delta: ${c.short.callDelta.toFixed(3)}, 收入 ${(3 * c.short.callBid).toFixed(4)})</div>
-                            <div><strong>净权利金:</strong> +${c.netCredit.toFixed(4)} <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(c.ratio*100).toFixed(0)}%)</span></div>
+                        <div style="margin-bottom:12px; padding:10px; border-left: 3px solid #ef4444; background: rgba(239, 68, 68, 0.08); border-radius: 4px;">
+                            <div style="color:#ef4444; font-weight:bold; margin-bottom:4px; font-size:13px;">🐻 看涨比例价差 (做空上方)</div>
+                            <div>买入 1手 @ <span style="font-family:monospace; font-weight:bold;">${c.long.strike}</span> (花费 ${c.long.callAsk.toFixed(4)})</div>
+                            <div>卖出 3手 @ <span style="font-family:monospace; font-weight:bold;">${c.short.strike}</span> (Delta: ${c.short.callDelta.toFixed(3)}, 收入 ${(3 * c.short.callBid).toFixed(4)})</div>
+                            <div><strong>净权利金:</strong> <span style="color:#34d399; font-weight:bold;">+${c.netCredit.toFixed(4)}</span> <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(c.ratio*100).toFixed(0)}%)</span></div>
                             <div><strong>保护位/最大利润点:</strong> ${c.short.strike}</div>
                             <div style="color:#f87171; font-weight:bold; margin-top:4px;">💀 真实止损线 (Breakeven): ${breakEven.toFixed(4)}</div>
                         </div>
@@ -205,11 +260,11 @@
                     const p = bestPutCombo;
                     const breakEven = p.short.strike - (p.netCredit + p.long.strike - p.short.strike) / 2;
                     html += `
-                        <div style="margin-bottom:8px; padding:8px; border-left: 3px solid #10b981; background: rgba(16, 185, 129, 0.1);">
-                            <div style="color:#10b981; font-weight:bold; margin-bottom:4px;">🐂 看跌比例价差 (做多下方)</div>
-                            <div>买入 1手 @ ${p.long.strike} (花费 ${p.long.putAsk.toFixed(4)})</div>
-                            <div>卖出 3手 @ ${p.short.strike} (Delta: ${p.short.putDelta.toFixed(3)}, 收入 ${(3 * p.short.putBid).toFixed(4)})</div>
-                            <div><strong>净权利金:</strong> +${p.netCredit.toFixed(4)} <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(p.ratio*100).toFixed(0)}%)</span></div>
+                        <div style="margin-bottom:8px; padding:10px; border-left: 3px solid #10b981; background: rgba(16, 185, 129, 0.08); border-radius: 4px;">
+                            <div style="color:#10b981; font-weight:bold; margin-bottom:4px; font-size:13px;">🐂 看跌比例价差 (做多下方)</div>
+                            <div>买入 1手 @ <span style="font-family:monospace; font-weight:bold;">${p.long.strike}</span> (花费 ${p.long.putAsk.toFixed(4)})</div>
+                            <div>卖出 3手 @ <span style="font-family:monospace; font-weight:bold;">${p.short.strike}</span> (Delta: ${p.short.putDelta.toFixed(3)}, 收入 ${(3 * p.short.putBid).toFixed(4)})</div>
+                            <div><strong>净权利金:</strong> <span style="color:#34d399; font-weight:bold;">+${p.netCredit.toFixed(4)}</span> <span style="color:#9ca3af; font-size:10px;">(保护支出占比 ${(p.ratio*100).toFixed(0)}%)</span></div>
                             <div><strong>保护位/最大利润点:</strong> ${p.short.strike}</div>
                             <div style="color:#34d399; font-weight:bold; margin-top:4px;">💀 真实止损线 (Breakeven): ${breakEven.toFixed(4)}</div>
                         </div>
@@ -217,18 +272,20 @@
                 }
 
                 if (!bestCallCombo && !bestPutCombo) {
-                    html = `<div style="color: #fbbf24;">当前可见视图中没有符合严格策略的组合。请尝试上下滚动页面加载更多远端期权后重试。</div>`;
+                    html = `<div style="color: #fbbf24; padding: 6px;">当前合约中没有符合 Delta < 0.2 且花费占比 40%~60% 的严格策略组合。</div>`;
                 }
 
                 resultBox.innerHTML = html;
 
             } catch (err) {
                 resultBox.style.display = 'block';
-                resultBox.innerHTML = `<span style="color: #ef4444; font-weight: bold;">❌ 解析错误:</span> <br/><span style="color: #fca5a5;">${err.message}</span>`;
+                resultBox.innerHTML = `
+                    <div style="color: #ef4444; font-weight: bold; margin-bottom: 4px;">❌ 解析错误:</div>
+                    <div style="color: #fca5a5; font-size: 11px;">${err.message}</div>
+                `;
             }
         });
 
-        contentBox.appendChild(warnText);
         contentBox.appendChild(button);
         contentBox.appendChild(resultBox);
         container.appendChild(header);
