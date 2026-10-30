@@ -306,7 +306,7 @@
                     if (!name) continue;
                     // SPA 切视频后 performance 里仍有上一支视频的资源，按页面切换时间过滤
                     if (pageKeyStartedAt > 0 && Number(entry.startTime) > 0 &&
-                        Number(entry.startTime) < pageKeyStartedAt - 500) {
+                        Number(entry.startTime) < pageKeyStartedAt - 3000) {
                         continue;
                     }
                     add(name);
@@ -821,7 +821,8 @@
         addGlobalStyles();
 
         lastPageKey = location.pathname + location.search;
-        pageKeyStartedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+        // 首次加载不过滤 performance 记录；SPA 切页时才记录切换时间
+        pageKeyStartedAt = 0;
         setInterval(() => {
             if (syncPageKey()) setButtonState('idle');
         }, 800);
