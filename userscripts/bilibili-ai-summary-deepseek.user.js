@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 AI 总结 (跳转 DeepSeek 网页端)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.2
+// @version      1.3
 // @author       Ace & Macro
 // @description  在B站播放器右上角添加按钮，抓取字幕与视频信息，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
 // @match        *://*.bilibili.com/video/*
@@ -32,6 +32,21 @@
 
 (function () {
     'use strict';
+
+    // 已安装新版多模型脚本时自动停用，避免重复按钮
+    if (isMultiScriptInstalled()) return;
+
+    function isMultiScriptInstalled() {
+        try {
+            return !!(
+                window.__VIDEO_AI_SUMMARY_MULTI__ ||
+                (typeof unsafeWindow !== 'undefined' && unsafeWindow.__VIDEO_AI_SUMMARY_MULTI__) ||
+                (document.documentElement && document.documentElement.dataset.videoAiSummaryMulti)
+            );
+        } catch (e) {
+            return false;
+        }
+    }
 
     const STORAGE_KEY = 'BILI_DEEPSEEK_PENDING_PROMPT';
     const DEEPSEEK_URL = 'https://chat.deepseek.com/';
@@ -839,6 +854,10 @@
     }
 
     function runBilibili() {
+        if (isMultiScriptInstalled()) {
+            console.info('[BILI-AI] 已检测到多模型脚本，旧脚本自动停用');
+            return;
+        }
         addGlobalStyles();
 
         lastPageKey = location.pathname + location.search;
@@ -889,6 +908,7 @@
     }
 
     function runDeepSeek() {
+        if (isMultiScriptInstalled()) return;
         const task = readPendingTask();
         if (!task) return;
 

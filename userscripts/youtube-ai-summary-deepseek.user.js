@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube AI 总结 (跳转 DeepSeek 网页端)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  在视频右上角添加按钮，抓取 YouTube 字幕，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
 // @author       You
 // @match        https://www.youtube.com/watch*
@@ -18,6 +18,20 @@
 
 (function() {
     'use strict';
+
+    // 已安装新版多模型脚本时自动停用，避免重复按钮
+    if (isMultiScriptInstalled()) return;
+
+    function isMultiScriptInstalled() {
+        try {
+            return !!(
+                window.__VIDEO_AI_SUMMARY_MULTI__ ||
+                (document.documentElement && document.documentElement.dataset.videoAiSummaryMulti)
+            );
+        } catch (e) {
+            return false;
+        }
+    }
 
     const STORAGE_KEY = 'YT_DEEPSEEK_PENDING_PROMPT';
 
@@ -108,6 +122,10 @@
     //  YouTube 侧
     // =================================================================
     function runYouTube() {
+        if (isMultiScriptInstalled()) {
+            console.info('[YT-AI] 已检测到多模型脚本，旧脚本自动停用');
+            return;
+        }
         // 注入样式，改用 absolute 相对视频容器定位
         const style = document.createElement('style');
         style.textContent = `
@@ -289,6 +307,7 @@
     //  DeepSeek 侧（纯网页操作，无 API）
     // =================================================================
     function runDeepSeek() {
+        if (isMultiScriptInstalled()) return;
         const raw = GM_getValue(STORAGE_KEY, null);
         if (!raw) return;
 
