@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.0
+// @version      1.1
 // @author       Ace & Macro
 // @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问）并自动填入发送。
 // @match        *://*.bilibili.com/video/*
@@ -648,24 +648,51 @@
         return JSON.parse(String(text).replace(/^\uFEFF/, ''));
     }
 
-    function pickSubtitle(subtitles) {
-        if (!Array.isArray(subtitles) || subtitles.length === 0) return null;
+    function isMusicOnlyText(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return true;
 
-        const lanOf = (item) => String((item && item.lan) || '').toLowerCase();
-        const preferred = ['zh-cn', 'zh-hans', 'zh', 'ai-zh', 'zh-hant', 'zh-tw'];
+        const lines = trimmed.split(/\n+/).map(line => line.trim()).filter(Boolean);
+        if (!lines.length) return true;
 
-        for (const lan of preferred) {
-            const hit = subtitles.find(item => lanOf(item) === lan && item.subtitle_url);
-            if (hit) return hit;
+        // “♪ 音乐 ♪”“[音效]”这类纯音乐/音效轨没有总结价值
+        return lines.every(line =>
+            /^[♪♫\s\[\]()（）]*(?:音乐|音效|music|sound)[♪♫\s\[\]()（）]*$/i.test(line)
+        );
+    }
+
+    function transcriptScore(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed || isMusicOnlyText(trimmed)) return 0;
+        return trimmed.length;
+    }
+
+    function pickBestTranscript(candidates) {
+        let best = '';
+        let bestScore = 0;
+        for (const text of candidates) {
+            const score = transcriptScore(text);
+            if (score > bestScore) {
+                best = text;
+                bestScore = score;
+            }
         }
+        return best;
+    }
 
-        const zh = subtitles.find(item => lanOf(item).includes('zh') && item.subtitle_url);
-        if (zh) return zh;
+    function pickSubtitleCandidates(subtitles) {
+        const list = Array.isArray(subtitles)
+            ? subtitles.filter(item => item && item.subtitle_url)
+            : [];
+        if (!list.length) return [];
 
-        const en = subtitles.find(item => lanOf(item).startsWith('en') && item.subtitle_url);
-        if (en) return en;
+        const lanOf = item => String(item.lan || '').toLowerCase();
+        const zh = list.filter(item => lanOf(item).includes('zh'));
+        const en = list.filter(item => lanOf(item).startsWith('en'));
+        const pool = zh.length ? zh : (en.length ? en : list);
 
-        return subtitles.find(item => item.subtitle_url) || null;
+        // 同一语言下可能同时有“正文”和“音乐”两条 AI 轨道，全部拉下来按内容选
+        return pool.slice(0, 6);
     }
 
     async function tryGetSubtitleFromApi(ctx) {
@@ -714,23 +741,40 @@
             }
         }
 
+        let bestOverall = '';
+        let bestOverallScore = 0;
+
         for (const apiUrl of apiUrls) {
             try {
                 const json = await gmFetchJson(apiUrl, 8000);
                 const subtitles = json && json.data && json.data.subtitle && json.data.subtitle.subtitles;
-                if (Array.isArray(subtitles) && subtitles.length) {
-                    const picked = pickSubtitle(subtitles);
-                    if (picked && picked.subtitle_url) {
-                        // 先记下来：即使下载失败，错误提示和缓存重试也能用上
-                        recordSubtitleUrl(picked.subtitle_url);
-                        const content = await fetchSubtitleContent(picked.subtitle_url);
-                        if (content) return content;
-                    }
+                if (!Array.isArray(subtitles) || !subtitles.length) continue;
+
+                const candidates = pickSubtitleCandidates(subtitles);
+                const contents = [];
+
+                for (const track of candidates) {
+                    if (!track.subtitle_url) continue;
+                    // 先记下来：即使下载失败，错误提示和缓存重试也能用上
+                    recordSubtitleUrl(track.subtitle_url);
+                    try {
+                        const content = await fetchSubtitleContent(track.subtitle_url);
+                        if (content) contents.push(content);
+                    } catch (e) { /* 试下一条轨道 */ }
                 }
+
+                const best = pickBestTranscript(contents);
+                const score = transcriptScore(best);
+                if (score > bestOverallScore) {
+                    bestOverall = best;
+                    bestOverallScore = score;
+                }
+                // 已经拿到像样的正文，就不必再试后面的接口
+                if (score >= 200) return best;
             } catch (e) { /* 尝试下一个接口 */ }
         }
 
-        return '';
+        return bestOverall;
     }
 
     async function fetchSubtitleContent(url) {
@@ -784,12 +828,17 @@
     // 兜底：从已拦截的地址里抓；字幕列表响应可能比点击稍晚，做几次短暂重试
     async function getSubtitleFromCache(retries = 2) {
         for (let attempt = 0; attempt <= retries; attempt++) {
-            const urls = getSubtitleUrls();
-            for (const url of urls) {
-                try {
-                    const content = await fetchSubtitleContent(url);
-                    if (content && content.trim()) return content;
-                } catch (e) { /* 尝试下一个 */ }
+            const urls = getSubtitleUrls().slice(0, 6);
+            if (urls.length) {
+                const contents = await Promise.all(urls.map(async url => {
+                    try {
+                        return await fetchSubtitleContent(url);
+                    } catch (e) {
+                        return '';
+                    }
+                }));
+                const best = pickBestTranscript(contents);
+                if (best) return best;
             }
             if (attempt < retries) await sleep(250);
         }
@@ -842,6 +891,9 @@
             }
 
             const trimmedTranscript = transcript.trim();
+            if (transcriptScore(trimmedTranscript) === 0) {
+                throw new Error('抓到的字幕只有音乐/音效标记，请在播放器底部切换一次“中文”字幕再试');
+            }
             if (trimmedTranscript.length < 20) {
                 console.info('[视频AI] 字幕较短（' + trimmedTranscript.length + ' 字），仍继续发送');
             }
