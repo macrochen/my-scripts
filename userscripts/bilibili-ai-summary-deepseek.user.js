@@ -1,0 +1,890 @@
+// ==UserScript==
+// @name         B站 AI 总结 (跳转 DeepSeek 网页端)
+// @namespace    https://space.bilibili.com/398910090
+// @version      1.0
+// @author       Ace & Macro
+// @description  在B站播放器右上角添加按钮，抓取字幕与视频信息，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
+// @match        *://*.bilibili.com/video/*
+// @match        *://*.bilibili.com/bangumi/play/*
+// @match        https://chat.deepseek.com/*
+// @icon         https://www.bilibili.com/favicon.ico
+// @updateURL    https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/bilibili-ai-summary-deepseek.user.js
+// @downloadURL  https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/bilibili-ai-summary-deepseek.user.js
+// @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
+// @grant        GM_setClipboard
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        unsafeWindow
+// @connect      api.bilibili.com
+// @connect      *.bilibili.com
+// @connect      *.hdslb.com
+// @run-at       document-start
+// @noframes
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORAGE_KEY = 'BILI_DEEPSEEK_PENDING_PROMPT';
+    const DEEPSEEK_URL = 'https://chat.deepseek.com/';
+    const PENDING_TTL = 2 * 60 * 1000; // 待发送内容有效期：2 分钟
+    const DEBUG = false;
+
+    const SUMMARY_PROMPT = `请把我给定的内容（文字/视频）总结成一个"读完能记住"的版本。
+
+不是做摘要，是用你自己的话把这个东西重新讲一遍。讲完之后，别人应该能记住核心观点，还能复述出一两个关键细节。
+
+# 怎么写
+
+1. 先找到全文的一条主线。所有内容围绕这条线展开，偏离主线的素材直接扔掉。
+2. 沿着主线，挑出几个真正值得记住的点。每个点讲清楚：它在说什么、凭什么值得信。
+3. 细节不要全删。有画面感的例子、反常识的事实、作者自己说的原话，如果它能帮人记住观点，就留着。每个重点最多留一个这样的细节，不要贪多。
+4. 一段只说一件事。观点是一段，例子是一段，结论是一段。宁可多分段，不要挤成一堵墙。
+5. 如果是网页内容，在开头写上标题和原文链接。
+
+# 不要做的事
+
+- 不要加"解释："、"举例："、"关系："、"小结："这类标签。你在讲东西，不是在填表。
+- 不要用生硬的栏目标题把内容切成块。可以有结构，但不要让人看到骨架。
+- 不要为了工整而凑排比、凑对仗。
+- 不要在结尾写"总而言之"然后把前面说过的话再说一遍。
+- 不要用这些词："底层逻辑"、"认知升级"、"本质上"（一篇里最多出现1次）、"深度"、"维度"、"赋能"、"颗粒度"。
+- 不要用破折号（——）。
+
+# 补一段"但是"（仅在需要时）
+
+如果原文是在表达一个观点、给一个建议、或者论证一件事，总结写完之后，补一小段提醒：
+- 这个观点成立的前提是什么？换个场景还成立吗？
+- 读者最容易把什么当成绝对真理，但其实是有条件的？
+
+只在确实有值得说的时候写，写两三句就够。不要硬挑刺，不要为了显得"批判性思维"而强行唱反调。
+
+# 抛几个问题
+
+最后扔三四个值得接着想的问题。目的不是考记忆力，而是帮读者把内容接到自己的经验上。
+
+要求很简单：每个问题都得让人真的停下来想一想，不能是搜一下就有答案的。比如：
+- 内容里没有明说、但整个论证其实站在上面的那个前提，把它翻出来问
+- 把观点放到一个完全相反的场景里，看看还能不能站住
+- 跟读者自己正在做的事或正在纠结的决定挂上钩
+
+问的语气随意一点，像聊完天顺嘴说的，不要像出考题。
+
+# 语言
+
+- 简体中文。
+- 像在跟人说话，不像在写报告。
+- 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
+
+    const HOST = location.hostname;
+
+    // ================================================================
+    //  DeepSeek 分支
+    // ================================================================
+    if (HOST === 'chat.deepseek.com') {
+        whenDomReady(runDeepSeek);
+        return;
+    }
+
+    // ================================================================
+    //  B 站分支
+    // ================================================================
+    if (/(^|\.)bilibili\.com$/.test(HOST)) {
+        // 尽早挂上网络拦截，避免自动加载字幕时错过请求
+        installNetworkInterception();
+        whenDomReady(runBilibili);
+    }
+
+    // ================================================================
+    //  通用工具
+    // ================================================================
+    function whenDomReady(fn) {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', fn, { once: true });
+        } else {
+            fn();
+        }
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function log(...args) {
+        if (DEBUG) console.log('[BILI-AI]', ...args);
+    }
+
+    function openDeepSeekTab() {
+        try {
+            if (typeof GM_openInTab === 'function') {
+                GM_openInTab(DEEPSEEK_URL, { active: true, insert: true });
+                return;
+            }
+        } catch (e) {
+            log('GM_openInTab 失败，回退 window.open', e);
+        }
+        // 兜底。注意：异步点击后可能被浏览器拦截。
+        window.open(DEEPSEEK_URL, '_blank');
+    }
+
+    // ================================================================
+    //  B 站：网络拦截
+    // ================================================================
+    let interceptedSubtitleUrls = []; // [{ url, timestamp }]
+    let lastPageKey = '';
+    let summaryButton = null;
+    let isRunning = false;
+
+    function installNetworkInterception() {
+        hookXhr(window);
+        hookFetch(window);
+
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow !== window) {
+                hookXhr(unsafeWindow);
+                hookFetch(unsafeWindow);
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    function hookXhr(win) {
+        try {
+            const proto = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+            if (!proto || proto.__biliSummaryHooked) return;
+            proto.__biliSummaryHooked = true;
+            const originalOpen = proto.open;
+            proto.open = function (method, url) {
+                try {
+                    if (url && isSubtitleFileUrl(String(url))) {
+                        recordSubtitleUrl(String(url));
+                    }
+                } catch (e) { /* ignore */ }
+                return originalOpen.apply(this, arguments);
+            };
+        } catch (e) { /* ignore */ }
+    }
+
+    function hookFetch(win) {
+        try {
+            const originalFetch = win.fetch;
+            if (typeof originalFetch !== 'function' || originalFetch.__biliSummaryHooked) return;
+            const wrapped = function (input) {
+                try {
+                    const url = typeof input === 'string' ? input : (input && input.url);
+                    if (url && isSubtitleFileUrl(String(url))) {
+                        recordSubtitleUrl(String(url));
+                    }
+                } catch (e) { /* ignore */ }
+                return originalFetch.apply(this, arguments);
+            };
+            wrapped.__biliSummaryHooked = true;
+            win.fetch = wrapped;
+        } catch (e) { /* ignore */ }
+    }
+
+    function recordSubtitleUrl(url) {
+        const normalized = url.replace(/^https?:/, '');
+        if (!normalized) return;
+
+        // 去重并把最近出现的移到末尾
+        const index = interceptedSubtitleUrls.findIndex(item => item.url === normalized);
+        if (index !== -1) interceptedSubtitleUrls.splice(index, 1);
+
+        interceptedSubtitleUrls.push({ url: normalized, timestamp: Date.now() });
+        if (interceptedSubtitleUrls.length > 50) interceptedSubtitleUrls.shift();
+    }
+
+    function isSubtitleFileUrl(url) {
+        if (!url) return false;
+        if (url.includes('api.bilibili.com') || url.includes('data.bilibili.com')) return false;
+        const isSubtitle = url.includes('subtitle') || url.includes('aisubtitle');
+        return isSubtitle && (url.includes('auth_key') || url.includes('.json') || url.includes('/bfs/'));
+    }
+
+    // 从拦截记录 + 页面内联脚本中收集字幕地址，最新的优先
+    function getSubtitleUrls() {
+        const result = [];
+        const seen = new Set();
+
+        const add = (raw) => {
+            if (!raw) return;
+            const normalized = String(raw).replace(/^https?:/, '');
+            if (!normalized || seen.has(normalized) || !isSubtitleFileUrl(normalized)) return;
+            seen.add(normalized);
+            result.push('https:' + normalized);
+        };
+
+        for (let i = interceptedSubtitleUrls.length - 1; i >= 0; i--) {
+            add(interceptedSubtitleUrls[i].url);
+        }
+
+        try {
+            const scripts = document.querySelectorAll('script');
+            scripts.forEach(script => {
+                const content = script.textContent;
+                if (!content) return;
+                const matches = content.match(/https?:\/\/[^\s"']*(?:subtitle|ai_subtitle)[^\s"']*auth_key=[^\s"']*/g);
+                if (matches) matches.forEach(add);
+            });
+        } catch (e) { /* ignore */ }
+
+        return result;
+    }
+
+    // ================================================================
+    //  B 站：视频信息
+    // ================================================================
+    function getPageState() {
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow.__INITIAL_STATE__) {
+                return unsafeWindow.__INITIAL_STATE__;
+            }
+        } catch (e) { /* ignore */ }
+        try {
+            return window.__INITIAL_STATE__ || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getVideoContext() {
+        const ctx = { bvid: '', cid: '', epId: '', stateTitle: '', stateAuthor: '' };
+        const state = getPageState();
+        const p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1;
+
+        // URL 中的标识优先，避免番剧切集 / 多 P 切换后 __INITIAL_STATE__ 残留旧数据
+        const bvidMatch = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
+        if (bvidMatch) ctx.bvid = bvidMatch[1];
+
+        const epMatch = location.pathname.match(/\/bangumi\/play\/ep(\d+)/);
+        if (epMatch) ctx.epId = epMatch[1];
+        if (!ctx.epId) {
+            const epQuery = new URLSearchParams(location.search).get('ep_id');
+            if (epQuery && /^\d+$/.test(epQuery)) ctx.epId = epQuery;
+        }
+
+        try {
+            const vd = state && state.videoData;
+            const sameVideo = vd && (!ctx.bvid || !vd.bvid || vd.bvid === ctx.bvid);
+            if (vd && sameVideo) {
+                ctx.bvid = ctx.bvid || vd.bvid || '';
+                const pages = Array.isArray(vd.pages) ? vd.pages : [];
+                const page = pages.find(item => Number(item.page) === p) || pages[0];
+                ctx.cid = (page && page.cid) || vd.cid || '';
+                ctx.stateTitle = vd.title || '';
+                ctx.stateAuthor = (vd.owner && vd.owner.name) || '';
+                if (page && page.part && pages.length > 1) {
+                    ctx.stateTitle = `${ctx.stateTitle} - P${page.page} ${page.part}`;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        try {
+            const ep = state && state.epInfo;
+            const sameEpisode = ep && (!ctx.epId || !ep.id || String(ep.id) === ctx.epId);
+            if (ep && sameEpisode) {
+                ctx.bvid = ctx.bvid || ep.bvid || '';
+                ctx.cid = ctx.cid || ep.cid || '';
+                const media = (state && state.mediaInfo) || {};
+                const epTitle = ep.title || ep.long_title || '';
+                const mediaTitle = media.title || '';
+                if (!ctx.stateTitle) {
+                    ctx.stateTitle = (mediaTitle && epTitle)
+                        ? `${mediaTitle} - ${epTitle}`
+                        : (mediaTitle || epTitle);
+                }
+                ctx.stateAuthor = ctx.stateAuthor ||
+                    (media.upInfo && media.upInfo.uname) ||
+                    (ep.upInfo && ep.upInfo.uname) || '';
+            }
+        } catch (e) { /* ignore */ }
+
+        return ctx;
+    }
+
+    function getMediaMetadata(ctx) {
+        const pickText = (selectors) => {
+            for (const selector of selectors) {
+                try {
+                    const el = document.querySelector(selector);
+                    const text = el && el.textContent ? el.textContent.trim() : '';
+                    if (text) return text;
+                } catch (e) { /* ignore */ }
+            }
+            return '';
+        };
+
+        let rawTitle = '';
+        try { rawTitle = document.title || ''; } catch (e) { /* ignore */ }
+        let title = rawTitle.replace(/(_|-)\s*哔哩哔哩.*/, '').trim();
+
+        const mainTitle = pickText(['h1.video-title', '.media-info-title-t', '.video-title']);
+        const activePart = pickText([
+            '.video-pod__item.is-active .title',
+            '.list-box li.on .part',
+            '.ep-item.cursor'
+        ]);
+
+        if (mainTitle) {
+            if (activePart && !mainTitle.includes(activePart)) {
+                title = `${mainTitle}_${activePart}`;
+            } else if (!activePart && ctx.stateTitle && ctx.stateTitle.length > mainTitle.length) {
+                // 番剧/多 P 的选集标题通常比页面主标题更完整
+                title = ctx.stateTitle;
+            } else {
+                title = mainTitle;
+            }
+        } else if (ctx.stateTitle) {
+            title = ctx.stateTitle;
+        }
+
+        if (!title || title === 'bilibili' || title === '哔哩哔哩') {
+            title = ctx.stateTitle || '未知视频';
+        }
+
+        let author = pickText(['.up-name', '.username', '.staff-name', '.up-info--name', '.upname']);
+        if (!author) author = ctx.stateAuthor || '';
+
+        return {
+            title: title.trim(),
+            author: author.trim(),
+            url: location.href.split('#')[0]
+        };
+    }
+
+    // ================================================================
+    //  B 站：字幕获取
+    // ================================================================
+    function gmFetchText(url, timeout = 12000) {
+        return new Promise((resolve, reject) => {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: url,
+                    timeout: timeout,
+                    onload: (response) => {
+                        if (response.status >= 200 && response.status < 300) {
+                            resolve(response.responseText || '');
+                        } else {
+                            reject(new Error(`HTTP ${response.status}`));
+                        }
+                    },
+                    onerror: () => reject(new Error('网络请求失败')),
+                    ontimeout: () => reject(new Error('网络请求超时'))
+                });
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
+    async function gmFetchJson(url, timeout = 12000) {
+        const text = await gmFetchText(url, timeout);
+        return JSON.parse(String(text).replace(/^\uFEFF/, ''));
+    }
+
+    function pickSubtitle(subtitles) {
+        if (!Array.isArray(subtitles) || subtitles.length === 0) return null;
+
+        const lanOf = (item) => String((item && item.lan) || '').toLowerCase();
+        const preferred = ['zh-cn', 'zh-hans', 'zh', 'ai-zh', 'zh-hant', 'zh-tw'];
+
+        for (const lan of preferred) {
+            const hit = subtitles.find(item => lanOf(item) === lan && item.subtitle_url);
+            if (hit) return hit;
+        }
+
+        const zh = subtitles.find(item => lanOf(item).includes('zh') && item.subtitle_url);
+        if (zh) return zh;
+
+        const en = subtitles.find(item => lanOf(item).startsWith('en') && item.subtitle_url);
+        if (en) return en;
+
+        return subtitles.find(item => item.subtitle_url) || null;
+    }
+
+    async function tryGetSubtitleFromApi(ctx) {
+        const apiUrls = [];
+
+        // 番剧优先用 ep_id：切集后 URL 才是最新标识
+        if (ctx.epId) {
+            apiUrls.push(`https://api.bilibili.com/x/player/v2?ep_id=${encodeURIComponent(ctx.epId)}`);
+            apiUrls.push(`https://api.bilibili.com/x/player/wbi/v2?ep_id=${encodeURIComponent(ctx.epId)}`);
+        }
+
+        if (ctx.bvid) {
+            // __INITIAL_STATE__ 偶尔拿不到 cid，用 view 接口补一下
+            if (!ctx.cid) {
+                try {
+                    const view = await gmFetchJson(
+                        `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(ctx.bvid)}`,
+                        8000
+                    );
+                    const data = view && view.data;
+                    if (data) {
+                        const p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1;
+                        const pages = Array.isArray(data.pages) ? data.pages : [];
+                        const page = pages.find(item => Number(item.page) === p) || pages[0];
+                        ctx.cid = (page && page.cid) || data.cid || '';
+                        if (!ctx.stateTitle) ctx.stateTitle = data.title || '';
+                        if (!ctx.stateAuthor) ctx.stateAuthor = (data.owner && data.owner.name) || '';
+                    }
+                } catch (e) { /* ignore */ }
+            }
+
+            if (ctx.cid) {
+                apiUrls.push(`https://api.bilibili.com/x/player/v2?bvid=${encodeURIComponent(ctx.bvid)}&cid=${encodeURIComponent(ctx.cid)}`);
+                apiUrls.push(`https://api.bilibili.com/x/player/wbi/v2?bvid=${encodeURIComponent(ctx.bvid)}&cid=${encodeURIComponent(ctx.cid)}`);
+            }
+        }
+
+        for (const apiUrl of apiUrls) {
+            try {
+                const json = await gmFetchJson(apiUrl, 8000);
+                const subtitles = json && json.data && json.data.subtitle && json.data.subtitle.subtitles;
+                if (Array.isArray(subtitles) && subtitles.length) {
+                    const picked = pickSubtitle(subtitles);
+                    if (picked && picked.subtitle_url) {
+                        const content = await fetchSubtitleContent(picked.subtitle_url);
+                        if (content) return content;
+                    }
+                }
+            } catch (e) { /* 尝试下一个接口 */ }
+        }
+
+        return '';
+    }
+
+    async function fetchSubtitleContent(url) {
+        let fullUrl = String(url || '');
+        if (fullUrl.startsWith('//')) fullUrl = 'https:' + fullUrl;
+        if (!/^https?:\/\//i.test(fullUrl)) return '';
+
+        const text = await gmFetchText(fullUrl, 12000);
+        const data = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+        return jsonToTxt(data);
+    }
+
+    function jsonToTxt(subtitleData) {
+        let body = null;
+
+        if (subtitleData && Array.isArray(subtitleData.body)) {
+            body = subtitleData.body;
+        } else if (subtitleData && subtitleData.data && Array.isArray(subtitleData.data.body)) {
+            body = subtitleData.data.body;
+        }
+
+        if (!body) throw new Error('字幕数据格式异常');
+
+        const lines = [];
+        let last = '';
+        body.forEach(item => {
+            const line = String((item && item.content) || '').trim();
+            if (!line || line === last) return;
+            lines.push(line);
+            last = line;
+        });
+        return lines.join('\n');
+    }
+
+    // 兜底：从已拦截的地址里抓
+    async function getSubtitleFromCache() {
+        const urls = getSubtitleUrls();
+        for (const url of urls) {
+            try {
+                const content = await fetchSubtitleContent(url);
+                if (content && content.trim()) return content;
+            } catch (e) { /* 尝试下一个 */ }
+        }
+        return '';
+    }
+
+    // ================================================================
+    //  B 站：主流程
+    // ================================================================
+    function buildPayload(meta, transcript) {
+        const metaLines = [
+            `【视频标题】：${meta.title || '未知视频'}`,
+            `【视频链接】：${meta.url}`
+        ];
+        if (meta.author) metaLines.push(`【UP主】：${meta.author}`);
+
+        return `${SUMMARY_PROMPT}\n\n${metaLines.join('\n')}\n\n--- 视频字幕 ---\n${transcript.trim()}`;
+    }
+
+    async function triggerSummary() {
+        if (isRunning) return;
+        isRunning = true;
+        syncPageKey();
+        setButtonState('loading');
+        showInfoBar('正在抓取字幕，请稍候...', 'info', 0);
+
+        try {
+            const ctx = getVideoContext();
+
+            // API 与拦截缓存同时尝试，优先用 API 的结果
+            const apiTask = tryGetSubtitleFromApi(ctx).catch(() => '');
+            const cacheTask = getSubtitleFromCache().catch(() => '');
+
+            const apiText = await apiTask;
+            const cacheText = apiText ? '' : await cacheTask;
+            const transcript = apiText || cacheText;
+
+            if (!transcript || transcript.trim().length < 20) {
+                throw new Error('未抓取到字幕：请先在播放器底部打开/切换一次字幕，再点总结');
+            }
+
+            const meta = getMediaMetadata(ctx);
+            const payload = buildPayload(meta, transcript);
+
+            // 1. 存入油猴存储，带上时间戳，供新标签页一次性消费
+            GM_setValue(STORAGE_KEY, { content: payload, timestamp: Date.now() });
+
+            // 2. 剪贴板备份，自动填充失败时还能手动粘贴
+            try {
+                if (typeof GM_setClipboard === 'function') GM_setClipboard(payload, 'text');
+            } catch (e) { /* ignore */ }
+
+            // 3. 给存储一点点同步时间，然后打开新标签页（当前页面保持不变）
+            await sleep(120);
+            openDeepSeekTab();
+
+            showInfoBar('已打开 DeepSeek 新标签页，正在自动填入并发送...', 'success', 4000);
+            setButtonState('done');
+            setTimeout(() => setButtonState('idle'), 2500);
+        } catch (err) {
+            showInfoBar((err && err.message) ? err.message : String(err), 'error', 6000);
+            setButtonState('idle');
+        } finally {
+            isRunning = false;
+        }
+    }
+
+    // ================================================================
+    //  B 站：界面
+    // ================================================================
+    function addGlobalStyles() {
+        if (document.getElementById('bili-ai-summary-style')) return;
+        const style = document.createElement('style');
+        style.id = 'bili-ai-summary-style';
+        style.textContent = `
+            .bilibili-ai-summary-infobar {
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                max-width: 80vw;
+                background-color: rgba(25, 26, 27, 0.98);
+                border-radius: 8px;
+                padding: 12px 18px;
+                color: #fff;
+                font-size: 14px;
+                line-height: 1.5;
+                z-index: 2147483647;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+                transition: all 0.3s ease;
+                pointer-events: none;
+            }
+            .bilibili-ai-summary-infobar.info { border-left: 4px solid #00a1d6; }
+            .bilibili-ai-summary-infobar.success { border-left: 4px solid #52c41a; }
+            .bilibili-ai-summary-infobar.error { border-left: 4px solid #f5222d; }
+
+            .bpx-player-ai-summary-btn {
+                position: absolute;
+                top: 16px;
+                right: 20px;
+                z-index: 80;
+                background: rgba(0, 0, 0, 0.65);
+                color: #ffffff;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                padding: 6px 14px;
+                border-radius: 20px;
+                font-size: 13px;
+                font-weight: 500;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                backdrop-filter: blur(8px);
+                transition: all 0.25s ease;
+                user-select: none;
+            }
+            .bpx-player-ai-summary-btn:hover {
+                background: rgba(0, 161, 214, 0.85);
+                border-color: #00a1d6;
+                transform: scale(1.05);
+                box-shadow: 0 4px 15px rgba(0, 161, 214, 0.4);
+            }
+            .bpx-player-ai-summary-btn:disabled {
+                cursor: not-allowed;
+                opacity: 0.75;
+                transform: none;
+                box-shadow: none;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function showInfoBar(message, type = 'info', duration = 3000) {
+        const existing = document.querySelector('.bilibili-ai-summary-infobar');
+        if (existing) existing.remove();
+
+        const infoBar = document.createElement('div');
+        infoBar.className = `bilibili-ai-summary-infobar ${type}`;
+        infoBar.textContent = message;
+        (document.body || document.documentElement).appendChild(infoBar);
+
+        if (duration > 0) {
+            setTimeout(() => {
+                if (infoBar.parentNode) infoBar.remove();
+            }, duration);
+        }
+    }
+
+    function setButtonState(state) {
+        if (!summaryButton) return;
+
+        if (state === 'loading') {
+            summaryButton.disabled = true;
+            summaryButton.textContent = '⏳ 抓取字幕...';
+        } else if (state === 'done') {
+            summaryButton.disabled = true;
+            summaryButton.textContent = '✅ 已打开 DeepSeek';
+        } else {
+            summaryButton.disabled = false;
+            summaryButton.textContent = '✨ AI 总结';
+        }
+    }
+
+    function mountButton() {
+        const container = document.querySelector('#bilibili-player') ||
+            document.querySelector('.bpx-player-container') ||
+            document.querySelector('.bilibili-player-area');
+
+        if (!container) return;
+
+        if (!summaryButton) {
+            summaryButton = document.createElement('button');
+            summaryButton.type = 'button';
+            summaryButton.className = 'bpx-player-ai-summary-btn';
+            summaryButton.textContent = '✨ AI 总结';
+            summaryButton.title = '抓取字幕，并在新标签页打开 DeepSeek 总结';
+            summaryButton.addEventListener('click', (event) => {
+                event.stopPropagation();
+                event.preventDefault();
+                triggerSummary();
+            });
+        }
+
+        if (!container.contains(summaryButton)) {
+            container.appendChild(summaryButton);
+        }
+    }
+
+    // 页面地址变化时清空上一支视频/上一集的字幕缓存
+    function syncPageKey() {
+        const key = location.pathname + location.search;
+        if (key === lastPageKey) return false;
+        lastPageKey = key;
+        interceptedSubtitleUrls = [];
+        return true;
+    }
+
+    function runBilibili() {
+        addGlobalStyles();
+
+        lastPageKey = location.pathname + location.search;
+        setInterval(() => {
+            if (syncPageKey()) setButtonState('idle');
+        }, 800);
+
+        mountButton();
+        setInterval(mountButton, 1000);
+    }
+
+    // ================================================================
+    //  DeepSeek：自动填入并发送
+    // ================================================================
+    function readPendingTask() {
+        let value = null;
+        try {
+            value = GM_getValue(STORAGE_KEY, null);
+        } catch (e) {
+            return null;
+        }
+
+        if (!value) return null;
+
+        // 兼容纯字符串格式
+        if (typeof value === 'string') {
+            try { GM_deleteValue(STORAGE_KEY); } catch (e) { /* ignore */ }
+            return { content: value, timestamp: Date.now() };
+        }
+
+        if (!value.content) {
+            try { GM_deleteValue(STORAGE_KEY); } catch (e) { /* ignore */ }
+            return null;
+        }
+
+        const timestamp = Number(value.timestamp) || 0;
+        if (!timestamp || Date.now() - timestamp > PENDING_TTL) {
+            // 过期任务直接销毁，避免历史残留误触发
+            try { GM_deleteValue(STORAGE_KEY); } catch (e) { /* ignore */ }
+            return null;
+        }
+
+        // 一次性消费
+        try { GM_deleteValue(STORAGE_KEY); } catch (e) { /* ignore */ }
+        return { content: value.content, timestamp };
+    }
+
+    function runDeepSeek() {
+        const task = readPendingTask();
+        if (!task) return;
+
+        log('检测到待发送内容，等待 DeepSeek 输入框...');
+
+        waitForInputBox(20000).then(inputBox => {
+            if (!inputBox) {
+                console.warn('[BILI-AI] 未找到 DeepSeek 输入框，自动填充中止');
+                try {
+                    alert('未能自动填入 DeepSeek：输入框加载失败。总结内容已复制到剪贴板，请手动粘贴发送。');
+                } catch (e) { /* ignore */ }
+                return;
+            }
+            setTimeout(() => fillAndSend(inputBox, task.content), 600);
+        });
+    }
+
+    function waitForInputBox(timeout = 20000) {
+        return new Promise(resolve => {
+            const findInput = () => {
+                let el = document.querySelector('textarea#chat-input');
+                if (el) return el;
+
+                const textareas = Array.from(document.querySelectorAll('textarea'))
+                    .filter(item => item.offsetParent !== null);
+                if (textareas.length) return textareas[0];
+
+                const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                    .filter(item => item.offsetParent !== null);
+                if (editables.length) return editables[0];
+
+                return null;
+            };
+
+            const existing = findInput();
+            if (existing) {
+                resolve(existing);
+                return;
+            }
+
+            const observer = new MutationObserver(() => {
+                const el = findInput();
+                if (el) {
+                    observer.disconnect();
+                    resolve(el);
+                }
+            });
+
+            if (document.body) {
+                observer.observe(document.body, { childList: true, subtree: true });
+            }
+
+            setTimeout(() => {
+                observer.disconnect();
+                resolve(findInput());
+            }, timeout);
+        });
+    }
+
+    function fillAndSend(inputBox, text) {
+        log('开始填充 DeepSeek 输入框，长度:', text.length);
+        inputBox.focus();
+
+        if (inputBox.tagName === 'TEXTAREA') {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (setter) {
+                setter.call(inputBox, text);
+            } else {
+                inputBox.value = text;
+            }
+            inputBox.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: text
+            }));
+            inputBox.dispatchEvent(new Event('change', { bubbles: true }));
+            if (inputBox.setSelectionRange) {
+                inputBox.setSelectionRange(text.length, text.length);
+            }
+        } else {
+            inputBox.innerText = text;
+            inputBox.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: text
+            }));
+        }
+
+        let attempts = 0;
+        const timer = setInterval(() => {
+            attempts++;
+
+            const sendBtn = findSendButton();
+            if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
+                clearInterval(timer);
+                sendBtn.click();
+                log('已点击发送按钮');
+                return;
+            }
+
+            if (attempts >= 15) {
+                clearInterval(timer);
+                sendByEnter(inputBox);
+                log('未找到可用发送按钮，回退为回车发送');
+            }
+        }, 250);
+    }
+
+    function sendByEnter(inputBox) {
+        const options = {
+            bubbles: true,
+            cancelable: true,
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13
+        };
+        inputBox.dispatchEvent(new KeyboardEvent('keydown', options));
+        inputBox.dispatchEvent(new KeyboardEvent('keypress', options));
+        inputBox.dispatchEvent(new KeyboardEvent('keyup', options));
+    }
+
+    function findSendButton() {
+        const candidates = [
+            'button[aria-label="Send message"]',
+            'button[aria-label*="发送"]',
+            'button[aria-label*="Send"]',
+            'button[data-testid="send-button"]',
+            'div[role="button"][data-testid="send-button"]',
+            'div[role="button"][aria-label*="发送"]',
+            'div[role="button"][aria-label*="Send"]',
+            'button[type="submit"]'
+        ];
+
+        for (const selector of candidates) {
+            const buttons = document.querySelectorAll(selector);
+            for (const button of buttons) {
+                if (button.offsetParent !== null) return button;
+            }
+        }
+        return null;
+    }
+
+})();

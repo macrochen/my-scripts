@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube AI 总结 (跳转 DeepSeek 网页端)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  在视频右上角添加按钮，抓取 YouTube 字幕，跳转 DeepSeek 网页端自动填入提示词并发送。不调用 API。
+// @version      2.3
+// @description  在视频右上角添加按钮，抓取 YouTube 字幕，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
 // @author       You
 // @match        https://www.youtube.com/watch*
 // @match        https://chat.deepseek.com/*
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_openInTab
 // @license      MIT
 // ==/UserScript==
 
@@ -19,6 +20,17 @@
     'use strict';
 
     const STORAGE_KEY = 'YT_DEEPSEEK_PENDING_PROMPT';
+
+    // 在新标签页打开 DeepSeek，当前页面保持不变
+    function openDeepSeekTab() {
+        try {
+            if (typeof GM_openInTab === 'function') {
+                GM_openInTab('https://chat.deepseek.com/', { active: true, insert: true });
+                return;
+            }
+        } catch (e) { /* 回退 */ }
+        window.open('https://chat.deepseek.com/', '_blank');
+    }
 
     const SUMMARY_PROMPT = `请把我给定的内容（文字/视频）总结成一个"读完能记住"的版本。
 
@@ -142,10 +154,16 @@
                 }
 
                 const fullPrompt = SUMMARY_PROMPT + '\n\n--- 视频字幕 ---\n' + transcript;
-                GM_setValue(STORAGE_KEY, fullPrompt);
+                GM_setValue(STORAGE_KEY, { content: fullPrompt, timestamp: Date.now() });
 
-                btn.textContent = '↗ 跳转中...';
-                location.href = 'https://chat.deepseek.com/';
+                openDeepSeekTab();
+
+                // 当前页面保持不变，按钮稍后复位
+                btn.textContent = '✅ 已打开新标签页';
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.textContent = '✨ AI 总结';
+                }, 2500);
             } catch (err) {
                 alert('抓取失败：' + err.message);
                 btn.disabled = false;
@@ -271,10 +289,30 @@
     //  DeepSeek 侧（纯网页操作，无 API）
     // =================================================================
     function runDeepSeek() {
-        const pending = GM_getValue(STORAGE_KEY, null);
-        if (!pending) return;
+        const raw = GM_getValue(STORAGE_KEY, null);
+        if (!raw) return;
 
+        // 一次性消费
         GM_deleteValue(STORAGE_KEY);
+
+        let pending = '';
+        let timestamp = Date.now();
+
+        if (typeof raw === 'string') {
+            // 兼容旧格式
+            pending = raw;
+        } else if (raw && raw.content) {
+            pending = raw.content;
+            timestamp = Number(raw.timestamp) || 0;
+        } else {
+            return;
+        }
+
+        // 超过 2 分钟的任务作废，避免历史残留误触发
+        if (!timestamp || Date.now() - timestamp > 2 * 60 * 1000) {
+            console.warn('[YT-AI] 待发送内容已过期，跳过');
+            return;
+        }
 
         console.log('[YT-AI] 检测到待发送内容，等待 DeepSeek 输入框...');
 
