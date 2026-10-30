@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.2
+// @version      1.3
 // @author       Ace & Macro
 // @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。
 // @match        *://*.bilibili.com/video/*
@@ -424,7 +424,11 @@
         const index = interceptedSubtitleUrls.findIndex(item => item.url === normalized);
         if (index !== -1) interceptedSubtitleUrls.splice(index, 1);
 
-        interceptedSubtitleUrls.push({ url: normalized, timestamp: Date.now() });
+        interceptedSubtitleUrls.push({
+            url: normalized,
+            timestamp: Date.now(),
+            pageKey: location.pathname + location.search
+        });
         if (interceptedSubtitleUrls.length > 50) interceptedSubtitleUrls.shift();
     }
 
@@ -433,6 +437,33 @@
         if (url.includes('api.bilibili.com') || url.includes('data.bilibili.com')) return false;
         const isSubtitle = url.includes('subtitle') || url.includes('aisubtitle');
         return isSubtitle && (url.includes('auth_key') || url.includes('.json') || url.includes('/bfs/'));
+    }
+
+    function isAiSubtitleUrl(url) {
+        return /(?:ai_subtitle|aisubtitle)/i.test(String(url || ''));
+    }
+
+    // B 站 AI 字幕 URL 形如 /ai_subtitle/prod/<aid><cid><hash>?auth_key=...
+    // 用当前视频的 aid+cid 过滤掉上一支视频/缓存里残留的字幕地址
+    function isSubtitleUrlForCurrentVideo(url, ctx) {
+        if (!url) return false;
+        if (!isAiSubtitleUrl(url)) return true; // 用户上传字幕没有 aid/cid 前缀，无法按此过滤
+        if (!ctx || ctx.epId) return true;      // 番剧 URL 前缀格式未确认，不做强过滤
+        if (!ctx.aid || !ctx.cid) return true;  // 缺少 id 时无法判断
+
+        const match = String(url).match(/\/ai_subtitle\/prod\/([^?]+)/i) ||
+                      String(url).match(/\/ai_subtitle\/([^?]+)/i);
+        if (!match) return true;
+
+        const pathId = match[1];
+        if (!/^\d{10,}/.test(pathId)) return true;
+
+        const aid = String(ctx.aid);
+        const cid = String(ctx.cid);
+        if (pathId.startsWith(aid + cid)) return true;
+
+        // 兼容 aid/cid 之间带分隔符的格式
+        return pathId.includes(aid) && pathId.includes(cid);
     }
 
     function isSubtitleListApiUrl(url) {
@@ -472,6 +503,7 @@
     function getSubtitleUrls() {
         const result = [];
         const seen = new Set();
+        const currentPageKey = location.pathname + location.search;
 
         const add = (raw) => {
             if (!raw) return;
@@ -482,7 +514,9 @@
         };
 
         for (let i = interceptedSubtitleUrls.length - 1; i >= 0; i--) {
-            add(interceptedSubtitleUrls[i].url);
+            const item = interceptedSubtitleUrls[i];
+            if (item.pageKey && item.pageKey !== currentPageKey) continue;
+            add(item.url);
         }
 
         // 兜底：浏览器已经请求过的资源里找字幕地址（即使请求发生在脚本注入之前）
@@ -495,7 +529,7 @@
                     if (!name) continue;
                     // SPA 切视频后 performance 里仍有上一支视频的资源，按页面切换时间过滤
                     if (pageKeyStartedAt > 0 && Number(entry.startTime) > 0 &&
-                        Number(entry.startTime) < pageKeyStartedAt - 3000) {
+                        Number(entry.startTime) < pageKeyStartedAt - 1500) {
                         continue;
                     }
                     add(name);
@@ -717,6 +751,29 @@
         return pool.slice(0, 6);
     }
 
+    async function resolveVideoIds(ctx, force = false) {
+        if (!ctx || !ctx.bvid) return ctx;
+        if (!force && ctx.aid && ctx.cid) return ctx;
+
+        try {
+            const view = await gmFetchJson(
+                `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(ctx.bvid)}`,
+                8000
+            );
+            const data = view && view.data;
+            if (data) {
+                ctx.aid = data.aid || ctx.aid || '';
+                const p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1;
+                const pages = Array.isArray(data.pages) ? data.pages : [];
+                const page = pages.find(item => Number(item.page) === p) || pages[0];
+                ctx.cid = (page && page.cid) || data.cid || ctx.cid || '';
+                if (!ctx.stateTitle) ctx.stateTitle = data.title || '';
+                if (!ctx.stateAuthor) ctx.stateAuthor = (data.owner && data.owner.name) || '';
+            }
+        } catch (e) { /* 网络失败时保留原 ctx */ }
+        return ctx;
+    }
+
     async function tryGetSubtitleFromApi(ctx) {
         const apiUrls = [];
 
@@ -777,6 +834,10 @@
 
                 for (const track of candidates) {
                     if (!track.subtitle_url) continue;
+                    if (!isSubtitleUrlForCurrentVideo(track.subtitle_url, ctx)) {
+                        console.warn('[视频AI] 跳过非当前视频的字幕轨道:', track.subtitle_url.split('?')[0]);
+                        continue;
+                    }
                     // 先记下来：即使下载失败，错误提示和缓存重试也能用上
                     recordSubtitleUrl(track.subtitle_url);
                     try {
@@ -848,9 +909,11 @@
     }
 
     // 兜底：从已拦截的地址里抓；字幕列表响应可能比点击稍晚，做几次短暂重试
-    async function getSubtitleFromCache(retries = 2) {
+    async function getSubtitleFromCache(ctx, retries = 2) {
         for (let attempt = 0; attempt <= retries; attempt++) {
-            const urls = getSubtitleUrls().slice(0, 6);
+            const urls = getSubtitleUrls()
+                .filter(url => isSubtitleUrlForCurrentVideo(url, ctx))
+                .slice(0, 6);
             if (urls.length) {
                 const contents = await Promise.all(urls.map(async url => {
                     try {
@@ -893,21 +956,32 @@
 
             const ctx = getVideoContext();
 
+            // 关键：先按当前 URL 的 bvid 解析出正确的 aid/cid，避免 SPA 切换后沿用上一支视频的 ID
+            if (!ctx.epId) {
+                await resolveVideoIds(ctx, true).catch(() => {});
+            }
+
             // API 与拦截缓存同时尝试，优先用 API 的结果
             const apiTask = tryGetSubtitleFromApi(ctx).catch(() => '');
-            const cacheTask = getSubtitleFromCache().catch(() => '');
+            const cacheTask = getSubtitleFromCache(ctx).catch(() => '');
 
             const apiText = await apiTask;
             const cacheText = apiText ? '' : await cacheTask;
             const transcript = apiText || cacheText;
 
             const candidateUrls = getSubtitleUrls();
-            console.info('[视频AI] 字幕候选:', candidateUrls.map(url => url.split('?')[0]),
+            const matchingUrls = candidateUrls.filter(url => isSubtitleUrlForCurrentVideo(url, ctx));
+            const excludedUrls = candidateUrls.filter(url => !isSubtitleUrlForCurrentVideo(url, ctx));
+            console.info('[视频AI] 字幕候选:', matchingUrls.map(url => url.split('?')[0]),
+                '| 排除非当前视频:', excludedUrls.map(url => url.split('?')[0]),
                 '| API 长度:', apiText.length, '| 缓存长度:', cacheText.length);
 
             if (!transcript || !transcript.trim()) {
-                if (candidateUrls.length > 0) {
-                    throw new Error(`找到了 ${candidateUrls.length} 条字幕地址，但下载失败（可能已过期）：请重新切换一次字幕再试`);
+                if (matchingUrls.length > 0) {
+                    throw new Error(`找到了 ${matchingUrls.length} 条当前视频的字幕地址，但下载失败（可能已过期）：请重新切换一次字幕再试`);
+                }
+                if (excludedUrls.length > 0) {
+                    throw new Error('只找到了其他视频的字幕地址，已自动排除。请在播放器里重新切换一次当前视频的字幕再试');
                 }
                 throw new Error('未抓取到字幕：请先在播放器底部打开/切换一次字幕，再点总结');
             }
