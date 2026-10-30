@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.1
+// @version      1.2
 // @author       Ace & Macro
-// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问）并自动填入发送。
+// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/watch*
@@ -19,6 +19,7 @@
 // @match        https://www.qianwen.com/*
 // @match        https://qianwen.com/*
 // @match        https://tongyi.aliyun.com/*
+// @match        https://yuanbao.tencent.com/*
 // @icon         https://www.bilibili.com/favicon.ico
 // @updateURL    https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/video-ai-summary-multi.user.js
 // @downloadURL  https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/video-ai-summary-multi.user.js
@@ -128,6 +129,27 @@
                 'button[aria-label*="Send"]',
                 'button[type="submit"]',
                 '[class*="send"]'
+            ]
+        },
+        {
+            id: 'yuanbao',
+            name: '元宝',
+            url: 'https://yuanbao.tencent.com/chat',
+            hosts: ['yuanbao.tencent.com'],
+            inputSelectors: [
+                '.ql-editor.ql-blank',
+                '.ql-editor',
+                '.message-input',
+                'textarea[placeholder*="输入"]',
+                'div[contenteditable="true"]',
+                'textarea'
+            ],
+            sendSelectors: [
+                '#yuanbao-send-btn',
+                'button[class*="send"]',
+                'button[aria-label*="发送"]',
+                'button[aria-label*="Send"]',
+                'button[type="submit"]'
             ]
         }
     ];
