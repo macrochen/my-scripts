@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 AI 总结 (跳转 DeepSeek 网页端)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.0
+// @version      1.1
 // @author       Ace & Macro
 // @description  在B站播放器右上角添加按钮，抓取字幕与视频信息，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
 // @match        *://*.bilibili.com/video/*
@@ -135,6 +135,7 @@
     // ================================================================
     let interceptedSubtitleUrls = []; // [{ url, timestamp }]
     let lastPageKey = '';
+    let pageKeyStartedAt = 0;
     let summaryButton = null;
     let isRunning = false;
 
@@ -155,14 +156,32 @@
             const proto = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
             if (!proto || proto.__biliSummaryHooked) return;
             proto.__biliSummaryHooked = true;
+
             const originalOpen = proto.open;
             proto.open = function (method, url) {
+                const urlText = url ? String(url) : '';
                 try {
-                    if (url && isSubtitleFileUrl(String(url))) {
-                        recordSubtitleUrl(String(url));
+                    this.__biliAiSummaryUrl = urlText;
+                    if (urlText && isSubtitleFileUrl(urlText)) {
+                        recordSubtitleUrl(urlText);
                     }
                 } catch (e) { /* ignore */ }
                 return originalOpen.apply(this, arguments);
+            };
+
+            const originalSend = proto.send;
+            proto.send = function () {
+                try {
+                    const urlText = this.__biliAiSummaryUrl || '';
+                    if (urlText && isSubtitleListApiUrl(urlText)) {
+                        this.addEventListener('load', function () {
+                            try {
+                                extractSubtitleUrlsFromResponse(this.responseText);
+                            } catch (e) { /* ignore */ }
+                        });
+                    }
+                } catch (e) { /* ignore */ }
+                return originalSend.apply(this, arguments);
             };
         } catch (e) { /* ignore */ }
     }
@@ -171,22 +190,45 @@
         try {
             const originalFetch = win.fetch;
             if (typeof originalFetch !== 'function' || originalFetch.__biliSummaryHooked) return;
+
             const wrapped = function (input) {
+                let urlText = '';
                 try {
-                    const url = typeof input === 'string' ? input : (input && input.url);
-                    if (url && isSubtitleFileUrl(String(url))) {
-                        recordSubtitleUrl(String(url));
+                    urlText = typeof input === 'string'
+                        ? input
+                        : ((input && input.url) || '');
+                    if (urlText && isSubtitleFileUrl(urlText)) {
+                        recordSubtitleUrl(urlText);
                     }
                 } catch (e) { /* ignore */ }
-                return originalFetch.apply(this, arguments);
+
+                const result = originalFetch.apply(this, arguments);
+
+                // 播放器请求字幕列表时，顺便从它的响应里把字幕 CDN 地址捞出来
+                if (urlText && isSubtitleListApiUrl(urlText)) {
+                    try {
+                        return result.then(response => {
+                            try {
+                                const clone = response.clone();
+                                clone.text()
+                                    .then(text => extractSubtitleUrlsFromResponse(text))
+                                    .catch(() => {});
+                            } catch (e) { /* ignore */ }
+                            return response;
+                        });
+                    } catch (e) { /* 返回原始 Promise */ }
+                }
+
+                return result;
             };
+
             wrapped.__biliSummaryHooked = true;
             win.fetch = wrapped;
         } catch (e) { /* ignore */ }
     }
 
     function recordSubtitleUrl(url) {
-        const normalized = url.replace(/^https?:/, '');
+        const normalized = String(url || '').replace(/^https?:/, '');
         if (!normalized) return;
 
         // 去重并把最近出现的移到末尾
@@ -202,6 +244,39 @@
         if (url.includes('api.bilibili.com') || url.includes('data.bilibili.com')) return false;
         const isSubtitle = url.includes('subtitle') || url.includes('aisubtitle');
         return isSubtitle && (url.includes('auth_key') || url.includes('.json') || url.includes('/bfs/'));
+    }
+
+    function isSubtitleListApiUrl(url) {
+        if (!url || !url.includes('api.bilibili.com')) return false;
+        return url.includes('/x/v2/subtitle/') ||
+            url.includes('/x/player/v2') ||
+            url.includes('/x/player/wbi/v2');
+    }
+
+    function extractSubtitleUrlsFromResponse(text) {
+        if (!text) return;
+
+        let json = null;
+        try {
+            json = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+        } catch (e) {
+            return; // 可能是 protobuf / 非 JSON 响应
+        }
+
+        const data = json && json.data;
+        if (!data) return;
+
+        const subtitles = [];
+        if (data.subtitle && Array.isArray(data.subtitle.subtitles)) {
+            subtitles.push(...data.subtitle.subtitles);
+        }
+        if (Array.isArray(data.subtitles)) {
+            subtitles.push(...data.subtitles);
+        }
+
+        subtitles.forEach(item => {
+            if (item && item.subtitle_url) recordSubtitleUrl(item.subtitle_url);
+        });
     }
 
     // 从拦截记录 + 页面内联脚本中收集字幕地址，最新的优先
@@ -220,6 +295,24 @@
         for (let i = interceptedSubtitleUrls.length - 1; i >= 0; i--) {
             add(interceptedSubtitleUrls[i].url);
         }
+
+        // 兜底：浏览器已经请求过的资源里找字幕地址（即使请求发生在脚本注入之前）
+        try {
+            if (typeof performance !== 'undefined' && performance.getEntriesByType) {
+                const entries = performance.getEntriesByType('resource') || [];
+                for (let i = entries.length - 1; i >= 0; i--) {
+                    const entry = entries[i];
+                    const name = entry && entry.name;
+                    if (!name) continue;
+                    // SPA 切视频后 performance 里仍有上一支视频的资源，按页面切换时间过滤
+                    if (pageKeyStartedAt > 0 && Number(entry.startTime) > 0 &&
+                        Number(entry.startTime) < pageKeyStartedAt - 500) {
+                        continue;
+                    }
+                    add(name);
+                }
+            }
+        } catch (e) { /* ignore */ }
 
         try {
             const scripts = document.querySelectorAll('script');
@@ -251,7 +344,7 @@
     }
 
     function getVideoContext() {
-        const ctx = { bvid: '', cid: '', epId: '', stateTitle: '', stateAuthor: '' };
+        const ctx = { bvid: '', aid: '', cid: '', epId: '', stateTitle: '', stateAuthor: '' };
         const state = getPageState();
         const p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1;
 
@@ -271,6 +364,7 @@
             const sameVideo = vd && (!ctx.bvid || !vd.bvid || vd.bvid === ctx.bvid);
             if (vd && sameVideo) {
                 ctx.bvid = ctx.bvid || vd.bvid || '';
+                ctx.aid = vd.aid || '';
                 const pages = Array.isArray(vd.pages) ? vd.pages : [];
                 const page = pages.find(item => Number(item.page) === p) || pages[0];
                 ctx.cid = (page && page.cid) || vd.cid || '';
@@ -287,6 +381,7 @@
             const sameEpisode = ep && (!ctx.epId || !ep.id || String(ep.id) === ctx.epId);
             if (ep && sameEpisode) {
                 ctx.bvid = ctx.bvid || ep.bvid || '';
+                ctx.aid = ctx.aid || ep.aid || '';
                 ctx.cid = ctx.cid || ep.cid || '';
                 const media = (state && state.mediaInfo) || {};
                 const epTitle = ep.title || ep.long_title || '';
@@ -415,6 +510,16 @@
             apiUrls.push(`https://api.bilibili.com/x/player/wbi/v2?ep_id=${encodeURIComponent(ctx.epId)}`);
         }
 
+        // 播放器当前实际使用的字幕列表接口（需要登录态，返回 JSON 时可直接拿到 subtitle_url）
+        if (ctx.aid) {
+            const contextExt = encodeURIComponent(JSON.stringify({ video_type: 1 }));
+            apiUrls.push(
+                `https://api.bilibili.com/x/v2/subtitle/web/view?oid=${encodeURIComponent(ctx.aid)}` +
+                `&pid=${encodeURIComponent(ctx.aid)}&context_ext=${contextExt}` +
+                `&type=1&cur_production_type=0&preferred_language=ai-zh&playlist_switch=0`
+            );
+        }
+
         if (ctx.bvid) {
             // __INITIAL_STATE__ 偶尔拿不到 cid，用 view 接口补一下
             if (!ctx.cid) {
@@ -425,6 +530,7 @@
                     );
                     const data = view && view.data;
                     if (data) {
+                        ctx.aid = ctx.aid || data.aid || '';
                         const p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1;
                         const pages = Array.isArray(data.pages) ? data.pages : [];
                         const page = pages.find(item => Number(item.page) === p) || pages[0];
@@ -448,6 +554,8 @@
                 if (Array.isArray(subtitles) && subtitles.length) {
                     const picked = pickSubtitle(subtitles);
                     if (picked && picked.subtitle_url) {
+                        // 先记下来：即使下载失败，错误提示和缓存重试也能用上
+                        recordSubtitleUrl(picked.subtitle_url);
                         const content = await fetchSubtitleContent(picked.subtitle_url);
                         if (content) return content;
                     }
@@ -490,14 +598,17 @@
         return lines.join('\n');
     }
 
-    // 兜底：从已拦截的地址里抓
-    async function getSubtitleFromCache() {
-        const urls = getSubtitleUrls();
-        for (const url of urls) {
-            try {
-                const content = await fetchSubtitleContent(url);
-                if (content && content.trim()) return content;
-            } catch (e) { /* 尝试下一个 */ }
+    // 兜底：从已拦截的地址里抓；字幕列表响应可能比点击稍晚，做几次短暂重试
+    async function getSubtitleFromCache(retries = 2) {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            const urls = getSubtitleUrls();
+            for (const url of urls) {
+                try {
+                    const content = await fetchSubtitleContent(url);
+                    if (content && content.trim()) return content;
+                } catch (e) { /* 尝试下一个 */ }
+            }
+            if (attempt < retries) await sleep(250);
         }
         return '';
     }
@@ -533,12 +644,24 @@
             const cacheText = apiText ? '' : await cacheTask;
             const transcript = apiText || cacheText;
 
-            if (!transcript || transcript.trim().length < 20) {
+            const candidateUrls = getSubtitleUrls();
+            console.info('[BILI-AI] 字幕候选:', candidateUrls.map(url => url.split('?')[0]),
+                '| API 长度:', apiText.length, '| 缓存长度:', cacheText.length);
+
+            if (!transcript || !transcript.trim()) {
+                if (candidateUrls.length > 0) {
+                    throw new Error(`找到了 ${candidateUrls.length} 条字幕地址，但下载失败（可能已过期）：请重新切换一次字幕再试`);
+                }
                 throw new Error('未抓取到字幕：请先在播放器底部打开/切换一次字幕，再点总结');
             }
 
+            const trimmedTranscript = transcript.trim();
+            if (trimmedTranscript.length < 20) {
+                console.info('[BILI-AI] 字幕较短（' + trimmedTranscript.length + ' 字），仍继续发送');
+            }
+
             const meta = getMediaMetadata(ctx);
-            const payload = buildPayload(meta, transcript);
+            const payload = buildPayload(meta, trimmedTranscript);
 
             // 1. 存入油猴存储，带上时间戳，供新标签页一次性消费
             GM_setValue(STORAGE_KEY, { content: payload, timestamp: Date.now() });
@@ -689,6 +812,7 @@
         const key = location.pathname + location.search;
         if (key === lastPageKey) return false;
         lastPageKey = key;
+        pageKeyStartedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
         interceptedSubtitleUrls = [];
         return true;
     }
@@ -697,6 +821,7 @@
         addGlobalStyles();
 
         lastPageKey = location.pathname + location.search;
+        pageKeyStartedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
         setInterval(() => {
             if (syncPageKey()) setButtonState('idle');
         }, 800);
