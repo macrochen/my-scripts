@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 AI 总结 (跳转 DeepSeek 网页端)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.1
+// @version      1.2
 // @author       Ace & Macro
 // @description  在B站播放器右上角添加按钮，抓取字幕与视频信息，在新标签页打开 DeepSeek 网页端并自动填入提示词发送。不调用 API。
 // @match        *://*.bilibili.com/video/*
@@ -19,6 +19,11 @@
 // @grant        unsafeWindow
 // @connect      api.bilibili.com
 // @connect      *.bilibili.com
+// @connect      aisubtitle.hdslb.com
+// @connect      i0.hdslb.com
+// @connect      i1.hdslb.com
+// @connect      i2.hdslb.com
+// @connect      s1.hdslb.com
 // @connect      *.hdslb.com
 // @run-at       document-start
 // @noframes
@@ -570,6 +575,22 @@
         let fullUrl = String(url || '');
         if (fullUrl.startsWith('//')) fullUrl = 'https:' + fullUrl;
         if (!/^https?:\/\//i.test(fullUrl)) return '';
+
+        // 优先用页面自己的 fetch：播放器已经成功请求过这个地址，
+        // 走页面上下文既带 Referer/Cookie，也不受 Tampermonkey @connect 限制。
+        try {
+            const pageFetch = (typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function')
+                ? unsafeWindow.fetch.bind(unsafeWindow)
+                : null;
+            if (pageFetch) {
+                const response = await pageFetch(fullUrl, { credentials: 'include' });
+                if (response && response.ok) {
+                    const text = await response.text();
+                    const data = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+                    return jsonToTxt(data);
+                }
+            }
+        } catch (e) { /* CORS / 权限问题，回退 GM_xmlhttpRequest */ }
 
         const text = await gmFetchText(fullUrl, 12000);
         const data = JSON.parse(String(text).replace(/^\uFEFF/, ''));
