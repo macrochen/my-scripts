@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.4
+// @version      1.5
 // @author       Ace & Macro
-// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。无字幕的 YouTube 视频改用 Google AI 模式按链接总结。
+// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。YouTube 视频统一走 Google AI 模式按链接总结（不依赖字幕）。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/watch*
@@ -51,58 +51,11 @@
 
     const TASK_KEYS = {
         bilibili: 'VIDEO_AI_SUMMARY_TASK_BILIBILI',
-        youtube: 'VIDEO_AI_SUMMARY_TASK_YOUTUBE',
-        google: 'VIDEO_AI_SUMMARY_TASK_GOOGLE'   // 无字幕时交给 Google AI 模式
+        google: 'VIDEO_AI_SUMMARY_TASK_GOOGLE'   // YouTube 统一走 Google AI 模式
     };
 
     const GOOGLE_QUERY_KEY = 'VIDEO_AI_SUMMARY_GOOGLE_QUERY';
 
-    // Google AI 模式（AI Mode）专用提示词：不喂字幕，直接让 AI 看视频链接
-    const LINK_SUMMARY_PROMPT = `请把我给定的视频链接({{URL}})的内容总结成一个"读完能记住"的版本。
-
-不是做摘要，是用你自己的话把这个东西重新讲一遍。讲完之后，别人应该能记住核心观点，还能复述出一两个关键细节。
-
-# 怎么写
-
-1. 先找到全文的一条主线。所有内容围绕这条线展开，偏离主线的素材直接扔掉。
-2. 沿着主线，挑出几个真正值得记住的点。每个点讲清楚：它在说什么、凭什么值得信。
-3. 细节不要全删。有画面感的例子、反常识的事实、作者自己说的原话，如果它能帮人记住观点，就留着。每个重点最多留一个这样的细节，不要贪多。
-4. 一段只说一件事。观点是一段，例子是一段，结论是一段。宁可多分段，不要挤成一堵墙。
-5. 如果是网页内容，在开头写上标题和原文链接。
-
-# 不要做的事
-
-- 不要加"解释："、"举例："、"关系："、"小结："这类标签。你在讲东西，不是在填表。
-- 不要用生硬的栏目标题把内容切成块。可以有结构，但不要让人看到骨架。
-- 不要为了工整而凑排比、凑对仗。
-- 不要在结尾写"总而言之"然后把前面说过的话再说一遍。
-- 不要用这些词："底层逻辑"、"认知升级"、"本质上"（一篇里最多出现1次）、"深度"、"维度"、"赋能"、"颗粒度"。
-- 不要用破折号（——）。
-
-# 补一段"但是"（仅在需要时）
-
-如果原文是在表达一个观点、给一个建议、或者论证一件事，总结写完之后，补一小段提醒：
-- 这个观点成立的前提是什么？换个场景还成立吗？
-- 读者最容易把什么当成绝对真理，但其实是有条件的？
-
-只在确实有值得说的时候写，写两三句就够。不要硬挑刺，不要为了显得"批判性思维"而强行唱反调。
-
-# 抛几个问题
-
-最后扔三四个值得接着想的问题。目的不是考记忆力，而是帮读者把内容接到自己的经验上。
-
-要求很简单：每个问题都得让人真的停下来想一想，不能是搜一下就有答案的。比如：
-- 内容里没有明说、但整个论证其实站在上面的那个前提，把它翻出来问
-- 把观点放到一个完全相反的场景里，看看还能不能站住
-- 跟读者自己正在做的事或正在纠结的决定挂上钩
-
-问的语气随意一点，像聊完天顺嘴说的，不要像出考题。
-
-# 语言
-
-- 简体中文。
-- 像在跟人说话，不像在写报告。
-- 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
     const PROVIDER_KEY = 'VIDEO_AI_SUMMARY_PROVIDER';
     const TASK_TTL = 2 * 60 * 1000; // 待发送内容有效期：2 分钟
     const DEBUG = false;
@@ -223,6 +176,53 @@
     } catch (e) { /* ignore */ }
 
     const SUMMARY_PROMPT = `请把我给定的内容（文字/视频）总结成一个"读完能记住"的版本。
+
+不是做摘要，是用你自己的话把这个东西重新讲一遍。讲完之后，别人应该能记住核心观点，还能复述出一两个关键细节。
+
+# 怎么写
+
+1. 先找到全文的一条主线。所有内容围绕这条线展开，偏离主线的素材直接扔掉。
+2. 沿着主线，挑出几个真正值得记住的点。每个点讲清楚：它在说什么、凭什么值得信。
+3. 细节不要全删。有画面感的例子、反常识的事实、作者自己说的原话，如果它能帮人记住观点，就留着。每个重点最多留一个这样的细节，不要贪多。
+4. 一段只说一件事。观点是一段，例子是一段，结论是一段。宁可多分段，不要挤成一堵墙。
+5. 如果是网页内容，在开头写上标题和原文链接。
+
+# 不要做的事
+
+- 不要加"解释："、"举例："、"关系："、"小结："这类标签。你在讲东西，不是在填表。
+- 不要用生硬的栏目标题把内容切成块。可以有结构，但不要让人看到骨架。
+- 不要为了工整而凑排比、凑对仗。
+- 不要在结尾写"总而言之"然后把前面说过的话再说一遍。
+- 不要用这些词："底层逻辑"、"认知升级"、"本质上"（一篇里最多出现1次）、"深度"、"维度"、"赋能"、"颗粒度"。
+- 不要用破折号（——）。
+
+# 补一段"但是"（仅在需要时）
+
+如果原文是在表达一个观点、给一个建议、或者论证一件事，总结写完之后，补一小段提醒：
+- 这个观点成立的前提是什么？换个场景还成立吗？
+- 读者最容易把什么当成绝对真理，但其实是有条件的？
+
+只在确实有值得说的时候写，写两三句就够。不要硬挑刺，不要为了显得"批判性思维"而强行唱反调。
+
+# 抛几个问题
+
+最后扔三四个值得接着想的问题。目的不是考记忆力，而是帮读者把内容接到自己的经验上。
+
+要求很简单：每个问题都得让人真的停下来想一想，不能是搜一下就有答案的。比如：
+- 内容里没有明说、但整个论证其实站在上面的那个前提，把它翻出来问
+- 把观点放到一个完全相反的场景里，看看还能不能站住
+- 跟读者自己正在做的事或正在纠结的决定挂上钩
+
+问的语气随意一点，像聊完天顺嘴说的，不要像出考题。
+
+# 语言
+
+- 简体中文。
+- 像在跟人说话，不像在写报告。
+- 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
+
+    // Google AI 模式（AI Mode）专用提示词：不喂字幕，直接让 AI 看视频链接
+    const LINK_SUMMARY_PROMPT = `请把我给定的视频链接({{URL}})的内容总结成一个"读完能记住"的版本。
 
 不是做摘要，是用你自己的话把这个东西重新讲一遍。讲完之后，别人应该能记住核心观点，还能复述出一两个关键细节。
 
@@ -1335,7 +1335,6 @@
     // ================================================================
     let ytWrap = null;
     let ytButton = null;
-    let ytSelect = null;
     let ytRunning = false;
 
     function runYouTube() {
@@ -1360,17 +1359,11 @@
             ytButton.id = 'yt-ai-summary-btn';
             ytButton.type = 'button';
             ytButton.textContent = '✨ AI 总结';
-            ytButton.title = '抓取字幕，并在新标签页打开所选 AI 总结';
+            ytButton.title = '在 Google AI 模式里总结这个视频（按链接）';
             ytButton.addEventListener('click', onYouTubeClick);
 
-            ytSelect = createProviderSelect(getSelectedProvider().id, (id) => {
-                setSelectedProvider(id);
-                console.info('[视频AI] 已切换模型:', getSelectedProvider().name);
-            });
-            ytSelect.id = 'yt-ai-summary-select';
-
+            // YouTube 统一走 Google AI 模式，所以不挂模型下拉框
             ytWrap.appendChild(ytButton);
-            ytWrap.appendChild(ytSelect);
         }
 
         async function onYouTubeClick() {
@@ -1379,64 +1372,31 @@
             setYouTubeButtonState('loading');
 
             try {
-                const provider = getSelectedProvider();
                 const videoUrl = location.href.split('#')[0];
 
-                let title = document.title || '';
-                title = title.replace(/\s*-\s*YouTube\s*$/, '').trim();
+                const title = document.title || '';
 
-                // 没有字幕就不硬抓，改走 Google AI 模式：直接把视频链接交给它
-                let transcript = '';
-                try {
-                    transcript = await getYouTubeTranscript();
-                } catch (e) {
-                    console.info('[视频AI] 字幕不可用，改用 Google AI 模式:', e && e.message);
-                }
-
-                if (!transcript || !transcript.trim()) {
-                    await sendToGoogleAiMode(videoUrl, title);
-                    setYouTubeButtonState('done');
-                    setTimeout(() => setYouTubeButtonState('idle'), 2500);
-                    return;
-                }
-
-                const payload = SUMMARY_PROMPT +
-                    '\n\n【视频标题】：' + title +
-                    '\n【视频链接】：' + videoUrl +
-                    '\n\n--- 视频字幕 ---\n' + transcript.trim();
-
-                GM_setValue(TASK_KEYS.youtube, {
-                    content: payload,
-                    timestamp: Date.now(),
-                    provider: provider.id,
-                    source: 'youtube'
-                });
-
-                try {
-                    if (typeof GM_setClipboard === 'function') GM_setClipboard(payload, 'text');
-                } catch (e) { /* ignore */ }
-
-                await sleep(120);
-                openProviderTab(provider);
+                // YouTube 统一走 Google AI 模式（AI Mode 能直接读视频链接），
+                // 不再抓取字幕、也不再跳所选聊天模型。
+                await sendToGoogleAiMode(videoUrl, title);
 
                 setYouTubeButtonState('done');
                 setTimeout(() => setYouTubeButtonState('idle'), 2500);
             } catch (err) {
-                alert('抓取失败：' + ((err && err.message) ? err.message : String(err)));
+                alert('打开失败：' + ((err && err.message) ? err.message : String(err)));
                 setYouTubeButtonState('idle');
             } finally {
                 ytRunning = false;
             }
         }
 
-        // 无字幕场景：打开空的 Google AI 模式页，由脚本把完整提示词填进去
+        // YouTube 统一入口：打开 Google AI 模式，由目标页把完整提示词填进去
         async function sendToGoogleAiMode(videoUrl, title) {
             const prompt = LINK_SUMMARY_PROMPT.replace('{{URL}}', videoUrl);
             const task = {
                 content: prompt,
                 timestamp: Date.now(),
                 videoUrl: videoUrl,
-                videoTitle: title || '',
                 source: 'youtube'
             };
 
@@ -1459,14 +1419,14 @@
             // 原页面同时打开一个新标签页。
             // 目标页会识别到 GOOGLE_QUERY_KEY，自动把一句话查询替换成完整提示词。
             GM_openInTab(url, { active: true, insert: true });
-            console.info('[视频AI] 无字幕，已打开 Google AI 模式:', url);
+            console.info('[视频AI] 已打开 Google AI 模式:', url);
         }
 
         function setYouTubeButtonState(state) {
             if (!ytButton) return;
             if (state === 'loading') {
                 ytButton.disabled = true;
-                ytButton.textContent = '⏳ 抓取字幕...';
+                ytButton.textContent = '⏳ 打开 AI 模式...';
             } else if (state === 'done') {
                 ytButton.disabled = true;
                 ytButton.textContent = '✅ 已打开新标签页';
@@ -1485,12 +1445,6 @@
 
             if (!ytWrap) createWrap();
 
-            // 其他标签页改了模型时同步下拉框
-            if (ytSelect && document.activeElement !== ytSelect) {
-                const selectedId = getSelectedProvider().id;
-                if (ytSelect.value !== selectedId) ytSelect.value = selectedId;
-            }
-
             if (!player.contains(ytWrap)) player.appendChild(ytWrap);
 
             // 清理旧单模型脚本可能残留的按钮，避免重复
@@ -1503,105 +1457,6 @@
         document.addEventListener('yt-navigate-finish', mountYouTubeButton);
         setInterval(mountYouTubeButton, 2000);
 
-        async function getYouTubeTranscript() {
-            const currentVideoId = new URLSearchParams(location.search).get('v') || '';
-            let playerResponse = null;
-            const moviePlayer = document.getElementById('movie_player');
-            if (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function') {
-                try { playerResponse = moviePlayer.getPlayerResponse(); } catch (e) { /* ignore */ }
-            }
-            if (!playerResponse) playerResponse = window.ytInitialPlayerResponse;
-
-            // SPA 切换视频后，播放器响应可能还是上一支视频的，按 videoId 校验
-            const responseVideoId =
-                (playerResponse && playerResponse.videoDetails && playerResponse.videoDetails.videoId) ||
-                (playerResponse && playerResponse.videoId) || '';
-            if (currentVideoId && responseVideoId && responseVideoId !== currentVideoId) {
-                // 丢弃后走下一个来源（ytInitialPlayerResponse 也可能是同一支旧视频），
-                // 不再使用它，直接视为无字幕，改走 Google AI 模式
-                console.info('[视频AI] 播放器响应属于其他视频，忽略其字幕');
-                playerResponse = null;
-            }
-
-            if (!playerResponse || !playerResponse.captions) {
-                throw new Error('当前视频没有字幕。');
-            }
-
-            const tracks = playerResponse.captions.playerCaptionsTracklistRenderer?.captionTracks;
-            if (!tracks || tracks.length === 0) throw new Error('当前视频没有字幕轨道。');
-
-            let track = tracks.find(t => t.languageCode === 'zh' || t.languageCode === 'zh-Hans');
-            if (!track) track = tracks.find(t => t.languageCode === 'en');
-            if (!track) track = tracks[0];
-
-            const baseUrl = track.baseUrl;
-            if (!baseUrl) throw new Error('无法获取字幕 URL。');
-
-            const isPoTokenGated = /[?&]exp=xpe\b/.test(baseUrl) && !/[?&]pot=/.test(baseUrl);
-
-            if (!isPoTokenGated) {
-                try {
-                    const resp = await fetch(baseUrl + '&fmt=json3', { credentials: 'include' });
-                    if (resp.ok) {
-                        const text = await resp.text();
-                        if (text && text.trim().length > 0) return parseYouTubeTranscript(text);
-                    }
-                } catch (e) { /* 回退到 DOM */ }
-            }
-            return await scrapeYouTubeTranscriptFromDOM();
-        }
-
-        function parseYouTubeTranscript(text) {
-            try {
-                const data = JSON.parse(text);
-                if (data.events) {
-                    return data.events
-                        .filter(event => event.segs)
-                        .map(event => event.segs.map(seg => seg.utf8).join(''))
-                        .join(' ')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                }
-            } catch (e) { /* ignore */ }
-            return String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        }
-
-        async function scrapeYouTubeTranscriptFromDOM() {
-            const transcriptBtn = document.querySelector(
-                'button[aria-label*="transcript" i], button[aria-label*="字幕" i]'
-            );
-            if (transcriptBtn) {
-                transcriptBtn.click();
-            } else {
-                const moreBtn = document.querySelector(
-                    'button[aria-label*="更多" i], button[aria-label*="More" i]'
-                );
-                if (moreBtn) {
-                    moreBtn.click();
-                    await sleep(500);
-                    const items = document.querySelectorAll('ytd-menu-service-item-renderer');
-                    for (const item of items) {
-                        if (item.textContent.includes('字幕') || item.textContent.toLowerCase().includes('transcript')) {
-                            item.click();
-                            break;
-                        }
-                    }
-                }
-            }
-
-            await sleep(2000);
-            const segments = document.querySelectorAll('ytd-transcript-segment-renderer');
-            if (segments.length === 0) {
-                throw new Error('无法抓取字幕，请确认视频包含字幕。');
-            }
-            return Array.from(segments)
-                .map(segment => {
-                    const textEl = segment.querySelector('.segment-text, yt-formatted-string');
-                    return textEl ? textEl.textContent.trim() : '';
-                })
-                .filter(Boolean)
-                .join(' ');
-        }
     }
 
     // ================================================================
