@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.5
+// @version      1.5.1
 // @author       Ace & Macro
-// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。YouTube 视频统一走 Google AI 模式按链接总结（不依赖字幕）。
+// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：统一走 Google AI 模式按链接总结。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/watch*
 // @match        https://youtube.com/watch*
+// @exclude      https://www.youtube.com/*
+// @exclude      https://youtube.com/*
 // @match        https://www.google.com/search*
 // @match        https://chat.deepseek.com/*
 // @match        https://chatgpt.com/*
@@ -1447,9 +1449,9 @@
 
             if (!player.contains(ytWrap)) player.appendChild(ytWrap);
 
-            // 清理旧单模型脚本可能残留的按钮，避免重复
-            document.querySelectorAll('#yt-ai-summary-btn').forEach(btn => {
-                if (!ytWrap.contains(btn)) btn.remove();
+            // 清理旧脚本/旧版本可能残留的内容，避免重复按钮或残留的下拉框
+            document.querySelectorAll('#yt-ai-summary-btn, #yt-ai-summary-select').forEach(el => {
+                if (!ytWrap.contains(el)) el.remove();
             });
         }
 
