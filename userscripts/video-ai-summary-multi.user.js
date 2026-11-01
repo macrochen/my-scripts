@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.3
+// @version      1.4
 // @author       Ace & Macro
-// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。
+// @description  在B站/YouTube播放器添加按钮，抓取字幕，在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入发送。无字幕的 YouTube 视频改用 Google AI 模式按链接总结。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/watch*
 // @match        https://youtube.com/watch*
+// @match        https://www.google.com/search*
 // @match        https://chat.deepseek.com/*
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -50,8 +51,58 @@
 
     const TASK_KEYS = {
         bilibili: 'VIDEO_AI_SUMMARY_TASK_BILIBILI',
-        youtube: 'VIDEO_AI_SUMMARY_TASK_YOUTUBE'
+        youtube: 'VIDEO_AI_SUMMARY_TASK_YOUTUBE',
+        google: 'VIDEO_AI_SUMMARY_TASK_GOOGLE'   // 无字幕时交给 Google AI 模式
     };
+
+    const GOOGLE_QUERY_KEY = 'VIDEO_AI_SUMMARY_GOOGLE_QUERY';
+
+    // Google AI 模式（AI Mode）专用提示词：不喂字幕，直接让 AI 看视频链接
+    const LINK_SUMMARY_PROMPT = `请把我给定的视频链接({{URL}})的内容总结成一个"读完能记住"的版本。
+
+不是做摘要，是用你自己的话把这个东西重新讲一遍。讲完之后，别人应该能记住核心观点，还能复述出一两个关键细节。
+
+# 怎么写
+
+1. 先找到全文的一条主线。所有内容围绕这条线展开，偏离主线的素材直接扔掉。
+2. 沿着主线，挑出几个真正值得记住的点。每个点讲清楚：它在说什么、凭什么值得信。
+3. 细节不要全删。有画面感的例子、反常识的事实、作者自己说的原话，如果它能帮人记住观点，就留着。每个重点最多留一个这样的细节，不要贪多。
+4. 一段只说一件事。观点是一段，例子是一段，结论是一段。宁可多分段，不要挤成一堵墙。
+5. 如果是网页内容，在开头写上标题和原文链接。
+
+# 不要做的事
+
+- 不要加"解释："、"举例："、"关系："、"小结："这类标签。你在讲东西，不是在填表。
+- 不要用生硬的栏目标题把内容切成块。可以有结构，但不要让人看到骨架。
+- 不要为了工整而凑排比、凑对仗。
+- 不要在结尾写"总而言之"然后把前面说过的话再说一遍。
+- 不要用这些词："底层逻辑"、"认知升级"、"本质上"（一篇里最多出现1次）、"深度"、"维度"、"赋能"、"颗粒度"。
+- 不要用破折号（——）。
+
+# 补一段"但是"（仅在需要时）
+
+如果原文是在表达一个观点、给一个建议、或者论证一件事，总结写完之后，补一小段提醒：
+- 这个观点成立的前提是什么？换个场景还成立吗？
+- 读者最容易把什么当成绝对真理，但其实是有条件的？
+
+只在确实有值得说的时候写，写两三句就够。不要硬挑刺，不要为了显得"批判性思维"而强行唱反调。
+
+# 抛几个问题
+
+最后扔三四个值得接着想的问题。目的不是考记忆力，而是帮读者把内容接到自己的经验上。
+
+要求很简单：每个问题都得让人真的停下来想一想，不能是搜一下就有答案的。比如：
+- 内容里没有明说、但整个论证其实站在上面的那个前提，把它翻出来问
+- 把观点放到一个完全相反的场景里，看看还能不能站住
+- 跟读者自己正在做的事或正在纠结的决定挂上钩
+
+问的语气随意一点，像聊完天顺嘴说的，不要像出考题。
+
+# 语言
+
+- 简体中文。
+- 像在跟人说话，不像在写报告。
+- 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
     const PROVIDER_KEY = 'VIDEO_AI_SUMMARY_PROVIDER';
     const TASK_TTL = 2 * 60 * 1000; // 待发送内容有效期：2 分钟
     const DEBUG = false;
@@ -218,6 +269,7 @@
 - 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
 
     const HOST = location.hostname;
+    let googleAiModeRunning = false;
 
     // ================================================================
     //  AI 模型页面分支
@@ -242,6 +294,14 @@
     // ================================================================
     if (/(^|\.)youtube\.com$/.test(HOST)) {
         whenDomReady(() => setTimeout(runYouTube, 0));
+    }
+
+    // ================================================================
+    //  Google AI 模式分支（只处理 udm=50 的搜索页）
+    // ================================================================
+    if (/(^|\.)google\.com$/.test(HOST) && isGoogleAiModePage()) {
+        whenDomReady(() => setTimeout(runGoogleAiMode, 0));
+        return;
     }
 
     // ================================================================
@@ -315,6 +375,31 @@
         }
         // 兜底。注意：异步点击后可能被浏览器拦截。
         window.open(provider.url, '_blank');
+    }
+
+    function buildGoogleUrl(query, extra) {
+        const params = new URLSearchParams();
+        params.set('q', query);
+        if (extra) {
+            extra.split('&').filter(Boolean).forEach(pair => {
+                const index = pair.indexOf('=');
+                if (index > 0) params.set(pair.slice(0, index), pair.slice(index + 1));
+            });
+        }
+        params.set('hl', 'zh-CN');
+        return 'https://www.google.com/search?' + params.toString();
+    }
+
+    function openGoogleTab(url) {
+        try {
+            if (typeof GM_openInTab === 'function') {
+                GM_openInTab(url, { active: true, insert: true });
+                return;
+            }
+        } catch (e) {
+            log('GM_openInTab 失败，回退 window.open', e);
+        }
+        window.open(url, '_blank');
     }
 
     // ================================================================
@@ -1295,17 +1380,29 @@
 
             try {
                 const provider = getSelectedProvider();
-                const transcript = await getYouTubeTranscript();
-                if (!transcript || !transcript.trim()) {
-                    throw new Error('字幕内容为空。');
-                }
+                const videoUrl = location.href.split('#')[0];
 
                 let title = document.title || '';
                 title = title.replace(/\s*-\s*YouTube\s*$/, '').trim();
 
+                // 没有字幕就不硬抓，改走 Google AI 模式：直接把视频链接交给它
+                let transcript = '';
+                try {
+                    transcript = await getYouTubeTranscript();
+                } catch (e) {
+                    console.info('[视频AI] 字幕不可用，改用 Google AI 模式:', e && e.message);
+                }
+
+                if (!transcript || !transcript.trim()) {
+                    await sendToGoogleAiMode(videoUrl, title);
+                    setYouTubeButtonState('done');
+                    setTimeout(() => setYouTubeButtonState('idle'), 2500);
+                    return;
+                }
+
                 const payload = SUMMARY_PROMPT +
                     '\n\n【视频标题】：' + title +
-                    '\n【视频链接】：' + location.href.split('#')[0] +
+                    '\n【视频链接】：' + videoUrl +
                     '\n\n--- 视频字幕 ---\n' + transcript.trim();
 
                 GM_setValue(TASK_KEYS.youtube, {
@@ -1330,6 +1427,39 @@
             } finally {
                 ytRunning = false;
             }
+        }
+
+        // 无字幕场景：打开空的 Google AI 模式页，由脚本把完整提示词填进去
+        async function sendToGoogleAiMode(videoUrl, title) {
+            const prompt = LINK_SUMMARY_PROMPT.replace('{{URL}}', videoUrl);
+            const task = {
+                content: prompt,
+                timestamp: Date.now(),
+                videoUrl: videoUrl,
+                videoTitle: title || '',
+                source: 'youtube'
+            };
+
+            // 一句话的链接查询：这个 AI 模式地址自带 q 参数，从 YouTube 页面直接新开最稳
+            const shortQuery = `请详细总结这个 YouTube 视频的内容：${videoUrl}`;
+            const url = buildGoogleUrl(shortQuery, 'udm=50&aep=42');
+
+            GM_setValue(TASK_KEYS.google, task);
+            GM_setValue(GOOGLE_QUERY_KEY, {
+                query: shortQuery,
+                prompt: prompt,
+                timestamp: Date.now()
+            });
+
+            try {
+                if (typeof GM_setClipboard === 'function') GM_setClipboard(prompt, 'text');
+            } catch (e) { /* ignore */ }
+
+            await sleep(120);
+            // 原页面同时打开一个新标签页。
+            // 目标页会识别到 GOOGLE_QUERY_KEY，自动把一句话查询替换成完整提示词。
+            GM_openInTab(url, { active: true, insert: true });
+            console.info('[视频AI] 无字幕，已打开 Google AI 模式:', url);
         }
 
         function setYouTubeButtonState(state) {
@@ -1374,12 +1504,25 @@
         setInterval(mountYouTubeButton, 2000);
 
         async function getYouTubeTranscript() {
+            const currentVideoId = new URLSearchParams(location.search).get('v') || '';
             let playerResponse = null;
             const moviePlayer = document.getElementById('movie_player');
             if (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function') {
                 try { playerResponse = moviePlayer.getPlayerResponse(); } catch (e) { /* ignore */ }
             }
             if (!playerResponse) playerResponse = window.ytInitialPlayerResponse;
+
+            // SPA 切换视频后，播放器响应可能还是上一支视频的，按 videoId 校验
+            const responseVideoId =
+                (playerResponse && playerResponse.videoDetails && playerResponse.videoDetails.videoId) ||
+                (playerResponse && playerResponse.videoId) || '';
+            if (currentVideoId && responseVideoId && responseVideoId !== currentVideoId) {
+                // 丢弃后走下一个来源（ytInitialPlayerResponse 也可能是同一支旧视频），
+                // 不再使用它，直接视为无字幕，改走 Google AI 模式
+                console.info('[视频AI] 播放器响应属于其他视频，忽略其字幕');
+                playerResponse = null;
+            }
+
             if (!playerResponse || !playerResponse.captions) {
                 throw new Error('当前视频没有字幕。');
             }
@@ -1459,6 +1602,177 @@
                 .filter(Boolean)
                 .join(' ');
         }
+    }
+
+    // ================================================================
+    //  Google AI 模式（无字幕视频的兜底方案）
+    // ================================================================
+    function isGoogleAiModePage() {
+        if (!/(^|\.)google\.com$/.test(location.hostname)) return false;
+        if (!location.pathname.startsWith('/search')) return false;
+        try {
+            return new URLSearchParams(location.search).get('udm') === '50';
+        } catch (e) {
+            return /[?&]udm=50(?:&|$)/.test(location.search);
+        }
+    }
+
+    function findGoogleSearchInput() {
+        const selectors = [
+            'textarea[name="q"]',
+            'textarea[aria-label]',
+            'input[name="q"]',
+            'textarea',
+            'div[contenteditable="true"][role="textbox"]',
+            'div[contenteditable="true"]'
+        ];
+        for (const selector of selectors) {
+            try {
+                const found = pickVisible(document.querySelectorAll(selector));
+                if (found) return found;
+            } catch (e) { /* ignore */ }
+        }
+        return null;
+    }
+
+    function fillGoogleInput(input, text) {
+        fillProviderInput(input, text);
+        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }));
+    }
+
+    function findGoogleSubmitButton(input) {
+        let node = input;
+        for (let depth = 0; depth < 6 && node; depth++) {
+            node = node.parentElement;
+            if (!node) break;
+            const buttons = node.querySelectorAll('button, [role="button"]');
+            for (const button of buttons) {
+                if (!isElementVisible(button)) continue;
+                if (button.getAttribute('aria-disabled') === 'true' || button.disabled) continue;
+                const label = (
+                    (button.getAttribute('aria-label') || '') + ' ' +
+                    (button.getAttribute('title') || '') + ' ' +
+                    (button.textContent || '')
+                ).toLowerCase();
+                if (/发送|send|submit|搜索|search/.test(label)) return button;
+            }
+        }
+        return document.querySelector('#gbg5') || null;
+    }
+
+    function submitGoogleQuery(input, text) {
+        // 优先点搜索框附近看起来像提交的按钮，避免误点麦克风/图片按钮
+        const sendBtn = findGoogleSubmitButton(input);
+        if (sendBtn) {
+            sendBtn.click();
+            return true;
+        }
+
+        const form = input.closest && input.closest('form');
+        if (form && form.requestSubmit) {
+            try {
+                form.requestSubmit();
+                return true;
+            } catch (e) { /* 继续尝试其他方式 */ }
+        }
+        if (form) {
+            try {
+                form.submit();
+                return true;
+            } catch (e) { /* 继续 */ }
+        }
+
+        // 回退：直接跳转到新的 AI 模式查询地址
+        location.href = buildGoogleUrl(text, 'udm=50&aep=42');
+        return true;
+    }
+
+    function waitForGoogleInput(timeout = 20000) {
+        return new Promise(resolve => {
+            const existing = findGoogleSearchInput();
+            if (existing) {
+                resolve(existing);
+                return;
+            }
+
+            let done = false;
+            const finish = (element) => {
+                if (done) return;
+                done = true;
+                try { observer.disconnect(); } catch (e) { /* ignore */ }
+                if (timer) clearTimeout(timer);
+                resolve(element);
+            };
+
+            const observer = new MutationObserver(() => {
+                const element = findGoogleSearchInput();
+                if (element) finish(element);
+            });
+
+            if (document.body) {
+                observer.observe(document.body, { childList: true, subtree: true });
+            }
+
+            const timer = setTimeout(() => finish(findGoogleSearchInput()), timeout);
+        });
+    }
+
+    function readGoogleTask() {
+        let raw = null;
+        try { raw = GM_getValue(TASK_KEYS.google, null); } catch (e) { return null; }
+        if (!raw || !raw.content) return null;
+
+        const timestamp = Number(raw.timestamp) || 0;
+        if (!timestamp || Date.now() - timestamp > TASK_TTL) {
+            try { GM_deleteValue(TASK_KEYS.google); } catch (e) { /* ignore */ }
+            return null;
+        }
+        return raw;
+    }
+
+    function readGoogleShortQuery() {
+        let raw = null;
+        try { raw = GM_getValue(GOOGLE_QUERY_KEY, null); } catch (e) { return null; }
+        try { GM_deleteValue(GOOGLE_QUERY_KEY); } catch (e) { /* ignore */ }
+
+        if (!raw || !raw.query) return null;
+        const timestamp = Number(raw.timestamp) || 0;
+        if (!timestamp || Date.now() - timestamp > TASK_TTL) return null;
+        return raw;
+    }
+
+    function runGoogleAiMode() {
+        if (googleAiModeRunning) return;
+
+        const shortQuery = readGoogleShortQuery();
+        const task = readGoogleTask();
+
+        if (!shortQuery && !task) return;
+
+        googleAiModeRunning = true;
+        const currentQuery = new URLSearchParams(location.search).get('q') || '';
+        const hasTaskQuery = /(?:^|&)q=/.test(location.search);
+        const fullPrompt = (shortQuery && shortQuery.prompt) || (task && task.content) || '';
+
+        console.info('[视频AI] Google AI 模式启动:', currentQuery ? '已带查询（将替换）' : '空查询');
+
+        waitForGoogleInput(20000).then(input => {
+            if (!input) {
+                console.warn('[视频AI] 未找到 Google 搜索框，提示词已复制到剪贴板');
+                return;
+            }
+
+            // 等页面稳定一点再操作，避免和 Google 自己的自动聚焦打架
+            setTimeout(() => {
+                fillGoogleInput(input, fullPrompt);
+                console.info('[视频AI] 已填入完整提示词，准备提交');
+
+                setTimeout(() => {
+                    try { GM_deleteValue(TASK_KEYS.google); } catch (e) { /* ignore */ }
+                    submitGoogleQuery(input, fullPrompt);
+                }, 600);
+            }, hasTaskQuery ? 2200 : 1200);
+        });
     }
 
     // ================================================================
