@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.6
+// @version      1.5.7
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.6';
+    const ZENMARK_SCRIPT_VERSION = '1.5.7';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -787,6 +787,14 @@
     }
 
     /**
+     * 页面上是否存在「复制文字」按钮（只要回答而不是整轮）
+     */
+    function hasTextCopyButton() {
+        return Array.from(document.querySelectorAll('[aria-label]'))
+            .some(x => /^复制文字$|^copy\s+text$/i.test(labelOf(x)));
+    }
+
+    /**
      * 统计某元素内“复制类按钮”的数量（用于排除跨回答的外层容器）
      */
     function countCopyButtons(el) {
@@ -1187,15 +1195,11 @@
 
                 // 「复制“问题”」这类整轮复制按钮只作为补充信息，
                 // 不作为独立锚点（提问行也有它，会造成重复注入）。
+                // 「复制“问题”」= 整轮复制按钮：只要页面上存在「复制文字」，
+                // 就一律不把它作为独立锚点（它紧挨着提问，anchor 会误配到提问区或整页）。
+                // 这里不依赖 DOM 兄弟关系，因为真实页面里两者可能分属不同分支。
                 const isTurnCopy = /^复制\s*[“"]/.test(labelOf(el));
-                if (isTurnCopy) {
-                    // 仅当同一工具栏里找不到“复制文字”时，才用它兜底
-                    const siblingText = bar.parentElement
-                        ? Array.from(bar.parentElement.querySelectorAll('[aria-label]'))
-                            .find(x => /^复制文字$|^copy\s+text$/i.test(labelOf(x)))
-                        : null;
-                    if (siblingText) return;
-                }
+                if (isTurnCopy && hasTextCopyButton()) return;
 
                 // 先按“工具栏与正文同父级”匹配（旧结构），失败再用复制按钮锚点匹配
                 const answer = findAnswerFor(bar, [el]) || findAnswerForCopyButton(el);
