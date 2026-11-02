@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.4
+// @version      1.5.5
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.4';
+    const ZENMARK_SCRIPT_VERSION = '1.5.5';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -791,21 +791,44 @@
     function looksLikeUserQuestion(container) {
         if (!container) return false;
 
-        // 容器里如果已经有 AI 回答的块级结构，就不是提问区
+        // 提问容器里如果已经含 AI 回答的结构，就肯定不是提问区
         if (container.querySelector('ul, ol, table, pre, blockquote, h1, h2, h3, h4')) return false;
 
-        const text = (stripChrome(container).textContent || '').replace(/\s+/g, '');
-        if (!text) return true;
+        const rawText = (stripChrome(container).textContent || '').replace(/\s+/g, '');
+        if (!rawText) return true;
 
-        // 提问通常是一条短句，回答通常是多段
-        const paras = Array.from(container.querySelectorAll('div, p'))
-            .filter(c => (c.textContent || '').replace(/\s+/g, '').length >= 6).length;
+        // ① 以问号结尾的短句 → 提问（提问常带问号，回答很少以问号收尾）
+        const endsWithQuestion = /[?？]\s*$/.test(rawText);
+        if (endsWithQuestion && rawText.length <= 200) return true;
 
-        if (paras >= 3) return false;      // 多段落 = 回答
-        if (text.length > 400) return false; // 长文本 = 回答
-        if (text.length <= 120) return true; // 短文本 = 提问
+        // ② 短文本 + 没有多段 → 提问
+        const blocks = Array.from(container.querySelectorAll('div, p'))
+            .filter(c => (c.textContent || '').replace(/\s+/g, '').length >= 6);
+        if (blocks.length <= 1 && rawText.length <= 150) return true;
+
+        // ③ 短文本、段数少 → 提问
+        if (blocks.length < 3 && rawText.length <= 120) return true;
 
         return false;
+    }
+
+    /**
+     * 判断容器是否“像 AI 回答”：有结构化的回答特征。
+     * 用于在提问/回答难以区分时，至少保证不会把提问当成回答注入。
+     */
+    function looksLikeAIAnswer(container) {
+        if (!container) return false;
+        // 回答常见结构：列表、代码、表格、引用、多级标题
+        if (container.querySelector('ul, ol, table, pre, blockquote, h2, h3, h4')) return true;
+
+        const text = (stripChrome(container).textContent || '').replace(/\s+/g, '');
+        // 回答通常较长，且不以问号结尾
+        if (text.length >= 200 && !/[?？]$/.test(text)) return true;
+
+        // 多段落（≥3）且总长可观
+        const paras = Array.from(container.querySelectorAll('div, p'))
+            .filter(c => (c.textContent || '').replace(/\s+/g, '').length >= 12);
+        return paras.length >= 3;
     }
 
     /**
@@ -1136,8 +1159,9 @@
                 const answer = findAnswerFor(bar, [el]) || findAnswerForCopyButton(el);
                 if (!answer) return;
 
-                // 排除用户提问区（提问行也有复制按钮，但不应注入）
-                if (looksLikeUserQuestion(answer.container)) return;
+                // 排除用户提问区：先判“像不像回答”，再判“像不像提问”，
+                // 避免提问文本较长时被误判为回答。
+                if (!looksLikeAIAnswer(answer.container) && looksLikeUserQuestion(answer.container)) return;
 
                 // 容器存在包含关系时视为同一条回答，合并到更大的容器
                 let host = null;
