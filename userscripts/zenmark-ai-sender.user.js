@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.3
+// @version      1.5.4
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.3';
+    const ZENMARK_SCRIPT_VERSION = '1.5.4';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -345,25 +345,30 @@
         const btn = document.createElement('button');
         btn.textContent = '📖 ZenMark';
         btn.className = 'ai-zenmark-btn icon-button';
+        btn.type = 'button';
+        // 定位为浮层兄弟元素：不参与父级 flex 布局，不会挤压/换行/被缩放。
+        // 位置由 wrapButtonOver 依据复制按钮的实际位置计算。
         btn.style.cssText = `
             cursor: pointer;
             display: inline-flex;
             align-items: center;
             justify-content: center;
+            box-sizing: border-box;
             font-size: 12px;
+            line-height: 16px;
+            height: 22px;
             color: #10b981;
-            margin-left: 8px;
             font-weight: 600;
             user-select: none;
             white-space: nowrap;
             background: rgba(16, 185, 129, 0.08);
             border: 1px solid rgba(16, 185, 129, 0.35);
             border-radius: 6px;
-            padding: 3px 8px;
-            z-index: 99;
-            transition: all 0.2s ease;
+            padding: 0 7px;
+            pointer-events: auto;
         `;
 
+        // 悬停只改颜色，不改任何影响盒子尺寸的属性
         btn.onmouseenter = () => {
             btn.style.backgroundColor = 'rgba(16, 185, 129, 0.18)';
             btn.style.borderColor = '#10b981';
@@ -780,6 +785,30 @@
     }
 
     /**
+     * 判断某个容器是不是“用户提问”区域（而不是 AI 回答）。
+     * 提问区特征：文本较短、以问号结尾、没有 AI 回答常见的结构（列表/代码/引用/多段）。
+     */
+    function looksLikeUserQuestion(container) {
+        if (!container) return false;
+
+        // 容器里如果已经有 AI 回答的块级结构，就不是提问区
+        if (container.querySelector('ul, ol, table, pre, blockquote, h1, h2, h3, h4')) return false;
+
+        const text = (stripChrome(container).textContent || '').replace(/\s+/g, '');
+        if (!text) return true;
+
+        // 提问通常是一条短句，回答通常是多段
+        const paras = Array.from(container.querySelectorAll('div, p'))
+            .filter(c => (c.textContent || '').replace(/\s+/g, '').length >= 6).length;
+
+        if (paras >= 3) return false;      // 多段落 = 回答
+        if (text.length > 400) return false; // 长文本 = 回答
+        if (text.length <= 120) return true; // 短文本 = 提问
+
+        return false;
+    }
+
+    /**
      * 以复制按钮为锚点，找它所属的那条回答容器。
      * 规则：向上找第一个“含实质正文、且不包含其它复制按钮”的祖先，
      * 这样相邻回答不会被合并，也不会取到整页。
@@ -1107,6 +1136,9 @@
                 const answer = findAnswerFor(bar, [el]) || findAnswerForCopyButton(el);
                 if (!answer) return;
 
+                // 排除用户提问区（提问行也有复制按钮，但不应注入）
+                if (looksLikeUserQuestion(answer.container)) return;
+
                 // 容器存在包含关系时视为同一条回答，合并到更大的容器
                 let host = null;
                 byContainer.forEach((info, key) => {
@@ -1159,6 +1191,48 @@
         return results;
     }
 
+    /**
+     * 把按钮以浮层形式挂在复制按钮旁边：
+     * - 用一个 fixed 定位的外层容器，位置跟随复制按钮实时计算
+     * - 不插入到 Google 的工具栏内部，因此不会影响原有布局（不换行、不缩放）
+     */
+    function wrapButtonOver(anchor, btn) {
+        // 外层：固定定位，紧贴在复制按钮右下方
+        btn.style.position = 'fixed';
+        btn.style.pointerEvents = 'auto';
+        document.body.appendChild(btn);
+
+        const reposition = () => {
+            if (!document.body.contains(anchor) || !document.body.contains(btn)) {
+                window.removeEventListener('scroll', schedule, true);
+                window.removeEventListener('resize', schedule, true);
+                return;
+            }
+            const r = anchor.getBoundingClientRect();
+            // 视口内不可见时隐藏，避免按钮停在不相关的位置
+            if (r.bottom < 0 || r.top > window.innerHeight || r.width === 0) {
+                btn.style.visibility = 'hidden';
+                return;
+            }
+            btn.style.visibility = 'visible';
+            btn.style.left = Math.round(r.left) + 'px';
+            btn.style.top = Math.round(r.bottom + 4) + 'px';
+        };
+
+        let raf = 0;
+        const schedule = () => {
+            if (raf) return;
+            raf = requestAnimationFrame(() => {
+                raf = 0;
+                reposition();
+            });
+        };
+
+        window.addEventListener('scroll', schedule, true);
+        window.addEventListener('resize', schedule, true);
+        reposition();
+    }
+
     function injectAIModeButtons() {
         if (!noteAIModeSession()) return;
 
@@ -1169,11 +1243,15 @@
         document.querySelectorAll('.ai-zenmark-btn').forEach(btn => {
             if (!document.body.contains(btn)) return btn.remove();
             const owner = btn.__zmAnswer;
-            if (owner && !validContainers.has(owner)) btn.remove();
+            // 回答已不在当前扫描结果中（或回答节点已被移除）→ 一并清理浮层
+            if (!owner || !validContainers.has(owner)) btn.remove();
         });
 
         targets.forEach(info => {
-            if (info.answer.container.querySelector('.ai-zenmark-btn')) return;
+            // 浮层按钮已挂在 body 上，改用“是否已存在绑定该回答的按钮”判断
+            const exist = Array.from(document.querySelectorAll('.ai-zenmark-btn'))
+                .find(b => b.__zmAnswer === info.answer.container);
+            if (exist) return;
             const anchor = info.copy.best || info.buttons[info.buttons.length - 1];
 
             // 主按钮：优先“复制文字”（只要回答），没有则用整轮复制
@@ -1185,7 +1263,8 @@
                 ? '发送到 ZenMark（只发送回答）'
                 : (info.copy.turn ? '发送到 ZenMark（使用 Google 复制本条回答）' : '发送到 ZenMark（自动转换为 Markdown）');
 
-            anchor.insertAdjacentElement('afterend', btn);
+            // 用浮层方式挂载：不占用工具栏的布局空间
+            wrapButtonOver(anchor, btn);
         });
     }
 
