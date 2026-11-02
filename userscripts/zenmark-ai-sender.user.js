@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.4.0
+// @version      1.4.1
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -25,13 +25,24 @@
 (function() {
     'use strict';
 
+    // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
+    const ZENMARK_SCRIPT_VERSION = '1.4.1';
+
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
+
+    // 本次脚本实例 ID（同一页面若被多个副本注入，可通过 __zenmarkInstance 发现）
+    const ZENMARK_INSTANCE_ID = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
     // 当前操作触发的按钮引用
     let currentTriggerBtn = null;
     // 剪贴板拦截标记（沿用全局变量，便于调试）
     window._ai_zenmark_trigger = false;
+    window.__zenmarkInstances = (window.__zenmarkInstances || []).concat([{
+        id: ZENMARK_INSTANCE_ID,
+        version: ZENMARK_SCRIPT_VERSION,
+        at: new Date().toISOString()
+    }]);
     let interceptTimer = null;
 
     // ================= 耗时统计（定位“慢在哪一段”） ================= //
@@ -546,24 +557,7 @@
         });
     };
 
-    // 便于排查问题的诊断入口：控制台执行 __zenmarkDiag()
-    window.__zenmarkAIDiag = function() {
-        if (!isGoogleSearch()) return { note: '当前不是 google.com/search 页面' };
-        const found = findAIModeActions();
-        return {
-            url: window.location.href,
-            detected: isAIModePage(),
-            hasUdm50: new URLSearchParams(window.location.search).get('udm') === '50',
-            answers: found.map(f => ({
-                reason: f.answer.reason,
-                copyButton: !!f.copyBtn,
-                className: f.answer.container.className || '',
-                preview: domToMarkdown(f.answer.container).slice(0, 120)
-            })),
-            injectedButtons: document.querySelectorAll('.ai-zenmark-btn').length
-        };
-    };
-
+    // 元宝诊断入口：控制台执行 __zenmarkDiag()（AI Mode 的诊断见 __zenmarkAIDiag）
     window.__zenmarkDiag = function() {
         const arrows = Array.prototype.slice.call(document.querySelectorAll(YB_MORE_SELECTOR));
         return {
@@ -972,6 +966,8 @@
         if (!isGoogleSearch()) return { note: '当前不是 google.com/search 页面' };
         const targets = collectAIModeTargets();
         return {
+            version: ZENMARK_SCRIPT_VERSION,
+            url: window.location.href,
             detected: isAIModePage(),
             answers: targets.map(t => ({
                 reason: t.answer.reason,
