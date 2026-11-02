@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.4.3
+// @version      1.4.4
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.4.3';
+    const ZENMARK_SCRIPT_VERSION = '1.4.4';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -1039,6 +1039,76 @@
     };
 
 
+    /**
+     * 结构导出：把候选工具栏及其周围的 DOM 摘要导出，用于校准选择器。
+     * 输出不含回答正文内容之外的敏感信息，仅结构与标签。
+     */
+    function describeNode(el, depth) {
+        if (!el || el.nodeType !== 1) return null;
+        const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+        const info = {
+            tag: el.tagName.toLowerCase(),
+            cls: cls.split(/\s+/).filter(Boolean).slice(0, 4).join(' '),
+            role: el.getAttribute('role') || undefined,
+            aria: el.getAttribute('aria-label') || undefined,
+            children: el.children.length
+        };
+        if (depth > 0) {
+            info.kids = Array.from(el.children).slice(0, 8).map(c => describeNode(c, depth - 1));
+        }
+        return info;
+    }
+
+    function dumpAIModeDOM() {
+        const out = {
+            version: ZENMARK_SCRIPT_VERSION,
+            url: location.href,
+            bodyChildren: document.body ? document.body.children.length : 0,
+            labels: [],
+            toolbarCandidates: []
+        };
+
+        // 所有与复制相关的按钮
+        document.querySelectorAll('[aria-label]').forEach(el => {
+            const label = el.getAttribute('aria-label') || '';
+            if (/复制|copy/i.test(label)) {
+                out.labels.push({
+                    label: label.slice(0, 60),
+                    tag: el.tagName.toLowerCase(),
+                    cls: ((el.className || '').toString()).slice(0, 60),
+                    parentTag: el.parentElement ? el.parentElement.tagName.toLowerCase() : null,
+                    parentCls: el.parentElement ? ((el.parentElement.className || '').toString()).slice(0, 60) : null,
+                    parentChildren: el.parentElement ? el.parentElement.children.length : 0,
+                    grandCls: el.parentElement && el.parentElement.parentElement
+                        ? ((el.parentElement.parentElement.className || '').toString()).slice(0, 60) : null
+                });
+            }
+        });
+
+        // 候选工具栏：每个“复制”按钮的父节点，以及它的父级链
+        candidateToolbars().slice(0, 6).forEach(bar => {
+            const chain = [];
+            let el = bar;
+            for (let i = 0; el && i < 6; i++, el = el.parentElement) {
+                chain.push(describeNode(el, 0));
+            }
+            out.toolbarCandidates.push({
+                bar: describeNode(bar, 2),
+                chain: chain,
+                substantial: hasSubstantialAnswer(bar),
+                otherToolbar: hasOtherToolbar(bar, bar),
+                matchedAnswer: (function () {
+                    try {
+                        const r = findAnswerFor(bar, toolbarButtons(bar) || []);
+                        return r ? r.reason : null;
+                    } catch (e) { return 'err:' + e.message; }
+                })()
+            });
+        });
+
+        return out;
+    }
+
     // ================= 导出到页面主世界（供浏览器控制台使用） ================= //
     // Tampermonkey 在 Chrome MV3 下默认运行在沙箱（isolated world），
     // 脚本里的 window 与 DevTools 控制台里的 window 不是同一个对象，
@@ -1058,6 +1128,7 @@
         host.__zenmarkAIDiag = window.__zenmarkAIDiag;
         host.__zenmarkInstances = window.__zenmarkInstances;
         host.__zenmarkShowDiag = showDiagOnPage;
+        host.__zenmarkDumpDOM = dumpAIModeDOM;
         return true;
     }
 
@@ -1094,6 +1165,7 @@
     }
 
     window.__zenmarkShowDiag = showDiagOnPage;
+    window.__zenmarkDumpDOM = dumpAIModeDOM;
 
     // ================= 页面元素查找与注入 ================= //
 
