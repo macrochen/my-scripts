@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.0
+// @version      1.5.1
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.0';
+    const ZENMARK_SCRIPT_VERSION = '1.5.1';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -1149,6 +1149,35 @@
                         ? ((el.parentElement.parentElement.className || '').toString()).slice(0, 60) : null
                 });
             }
+        });
+
+        // 以“复制文字”按钮为起点，逐级打印祖先链与每层判定（定位匹配失败点）
+        out.copyTextTraces = [];
+        document.querySelectorAll('[aria-label]').forEach(el => {
+            if (!/^复制文字$/.test((el.getAttribute('aria-label') || '').trim())) return;
+            if (out.copyTextTraces.length >= 3) return;
+            const chain = [];
+            let node = el;
+            for (let i = 0; node && i < 8; i++, node = node.parentElement) {
+                const kids = Array.from(node.children);
+                chain.push({
+                    depth: i,
+                    tag: node.tagName.toLowerCase(),
+                    cls: ((node.className || '').toString()).slice(0, 50),
+                    childCount: kids.length,
+                    childSummary: kids.slice(0, 10).map(k =>
+                        k.tagName.toLowerCase() + (k.getAttribute('aria-label') ? '[' + (k.getAttribute('aria-label') || '').slice(0, 14) + ']' : '')
+                    ).join(' | '),
+                    substantial: hasSubstantialAnswer(node),
+                    otherToolbar: hasOtherToolbar(node, el.parentElement || el),
+                    textLen: ((node.textContent || '').replace(/\s+/g, '')).slice(0, 0).length
+                });
+            }
+            out.copyTextTraces.push({
+                parentCls: el.parentElement ? ((el.parentElement.className || '').toString()).slice(0, 50) : null,
+                inCandidates: el.parentElement ? candidateToolbars().indexOf(el.parentElement) : -1,
+                chain: chain
+            });
         });
 
         // 候选工具栏：每个“复制”按钮的父节点，以及它的父级链
