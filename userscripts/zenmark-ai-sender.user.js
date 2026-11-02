@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.1
+// @version      1.5.2
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.1';
+    const ZENMARK_SCRIPT_VERSION = '1.5.2';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -748,6 +748,28 @@
     }
 
     /**
+     * 以复制按钮为锚点，找它所属的那条回答容器。
+     * 规则：向上找第一个“含实质正文、且不包含其它复制按钮”的祖先，
+     * 这样相邻回答不会被合并，也不会取到整页。
+     */
+    function findAnswerForCopyButton(btn) {
+        const container = btn.closest('.ai-zenmark-btn');
+        let el = btn.parentElement;
+        for (let depth = 0; el && depth < 10; depth++, el = el.parentElement) {
+            if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+
+            // 不能包含另一条回答的复制按钮
+            const otherCopies = Array.from(el.querySelectorAll('[aria-label]'))
+                .filter(x => AI_COPY_LABEL_RE.test(labelOf(x)) && !x.contains(btn) && x !== btn);
+            if (otherCopies.length) continue;
+
+            if (!hasSubstantialAnswer(el)) continue;
+            return { container: el, reason: 'copy-anchor-' + depth };
+        }
+        return null;
+    }
+
+    /**
      * 兜底：工具栏与正文不是同一父级时（懒加载 / 浮动布局）。
      * 思路：在整页里收集“实质正文块”，选与工具栏最近（公共祖先最深）的那块。
      */
@@ -800,7 +822,19 @@
     function hasSubstantialAnswer(el) {
         const blocks = el.querySelectorAll('p, li, table, pre, h1, h2, h3, h4, blockquote');
         if (blocks.length >= 2) return true;
+
         const text = (stripChrome(el).textContent || '').replace(/\s+/g, '');
+        if (text.length < 8) return false;
+
+        // 任意层级上有 ≥2 个“纯文字块”（div 分段）也算实质正文，
+        // 不要求它们是直接子节点（真实结构里正文常被多层包裹）
+        const textLeaves = Array.from(el.querySelectorAll('div, p, li, section, article'))
+            .filter(c => (c.textContent || '').replace(/\s+/g, '').length >= 4)
+            .filter(c => Array.from(c.children).every(k =>
+                (k.textContent || '').replace(/\s+/g, '').length === 0 ||
+                /^(A|SPAN|STRONG|EM|B|I|CODE)$/.test(k.tagName)));
+        if (textLeaves.length >= 2) return true;
+
         return text.length >= 25 && /[。！？.!?，,]/.test(text);
     }
 
@@ -1022,6 +1056,64 @@
     function collectAIModeTargets() {
         const results = [];
         const seen = new Set();
+
+        // 主路径：以“复制类按钮”本身为锚点（不要求父节点里有一堆按钮）。
+        // 真实结构里工具栏行常常只有 1 个真按钮 + 1 个包装 div，父节点并不“全是按钮”。
+        const copyButtons = Array.from(document.querySelectorAll('[aria-label]'))
+            .filter(el => AI_COPY_LABEL_RE.test(labelOf(el)));
+
+        if (copyButtons.length) {
+            // 先把每个复制按钮映射到它所属的回答容器，再按容器去重，
+            // 同一回答里的「复制“问题”」和「复制文字」只用一个按钮。
+            const byContainer = new Map();
+
+            copyButtons.forEach(el => {
+                const bar = el.parentElement;
+                if (!bar) return;
+
+                // 先按“工具栏与正文同父级”匹配（旧结构），失败再用复制按钮锚点匹配
+                const answer = findAnswerFor(bar, [el]) || findAnswerForCopyButton(el);
+                if (!answer) return;
+
+                // 容器存在包含关系时视为同一条回答，合并到更大的容器
+                let host = null;
+                byContainer.forEach((info, key) => {
+                    if (host) return;
+                    if (key === answer.container || key.contains(answer.container)) {
+                        host = info;
+                    } else if (answer.container.contains(key)) {
+                        // 新容器更大：迁移已有信息
+                        info.answer = { container: answer.container, reason: answer.reason };
+                        host = info;
+                    }
+                });
+
+                if (!host) {
+                    host = { bar: bar, buttons: [], answer: answer, copy: { turn: null, text: null, best: el } };
+                    byContainer.set(answer.container, host);
+                } else if (host.answer.container !== answer.container) {
+                    // 重新以更大的容器为 key
+                    byContainer.delete(host.answer.container);
+                    byContainer.set(answer.container, host);
+                    host.answer = { container: answer.container, reason: answer.reason };
+                }
+
+                host.buttons.push(el);
+                if (/^复制文字$|^copy\s+text$/i.test(labelOf(el))) host.copy.text = el;
+                else if (/^复制\s*[“"]/.test(labelOf(el))) host.copy.turn = el;
+            });
+
+            byContainer.forEach(info => {
+                if (!info.copy.text && /^复制文字$|^copy\s+text$/i.test(labelOf(info.copy.best))) {
+                    info.copy.text = info.copy.best;
+                }
+                info.copy.best = info.copy.text || info.copy.turn || info.copy.best;
+                results.push(info);
+            });
+            return results;
+        }
+
+        // 兜底：该版 AI Mode 没有复制按钮时，用“含 ≥2 个图标按钮的紧凑按钮组”识别
         candidateToolbars().forEach(bar => {
             const buttons = toolbarButtons(bar);
             if (!buttons) return;
