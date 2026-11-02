@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.4.1
+// @version      1.4.3
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.4.1';
+    const ZENMARK_SCRIPT_VERSION = '1.4.3';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -141,6 +141,57 @@
     }
 
     /**
+     * 统一 HTTP POST：优先 GM_xmlhttpRequest（可绕过 CORS），
+     * 缺失时（例如 @grant none 模式）回退到 fetch。
+     */
+    function httpPostJSON(url, body, handlers) {
+        if (typeof GM_xmlhttpRequest === 'function') {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: url,
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                data: body,
+                timeout: handlers.timeout || 45000,
+                onload: r => handlers.onload(r.status, r.responseText),
+                onerror: err => handlers.onerror(err),
+                ontimeout: () => handlers.ontimeout()
+            });
+            return;
+        }
+
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = setTimeout(() => {
+            if (controller) controller.abort();
+            handlers.ontimeout();
+        }, handlers.timeout || 45000);
+
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: body,
+            signal: controller ? controller.signal : undefined
+        })
+            .then(r => r.text().then(text => ({ status: r.status, text: text })))
+            .then(r => { clearTimeout(timer); handlers.onload(r.status, r.text); })
+            .catch(err => {
+                clearTimeout(timer);
+                if (err && err.name === 'AbortError') return;
+                handlers.onerror(err);
+            });
+    }
+
+    /**
+     * 打开新标签页：优先 GM_openInTab，缺失时用 window.open
+     */
+    function openZenMarkTab(url) {
+        if (typeof GM_openInTab === 'function') {
+            GM_openInTab(url, { active: true, insert: true });
+            return;
+        }
+        window.open(url, '_blank');
+    }
+
+    /**
      * 将截获的 Markdown 文本发送至 ZenMark 服务
      */
     function sendMarkdownToZenMark(markdownText, sourceBtn) {
@@ -157,35 +208,28 @@
         setPendingStatus(sourceBtn, '⏳ 传输中');
 
         markTiming('postStart');
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: ZENMARK_API_URL,
-            headers: {
-                'Content-Type': 'application/json; charset=utf-8'
-            },
-            data: JSON.stringify({
-                text: text,
-                title: title,
-                autoRead: false
-            }),
+        httpPostJSON(ZENMARK_API_URL, JSON.stringify({
+            text: text,
+            title: title,
+            autoRead: false
+        }), {
             timeout: 45000,
-            onload: function(response) {
+            onload: function(status, responseText) {
                 markTiming('postDone');
                 try {
-                    const result = JSON.parse(response.responseText);
-                    if (response.status === 200 && result.success && result.url) {
+                    const result = JSON.parse(responseText);
+                    if (status === 200 && result.success && result.url) {
                         finishStatus(sourceBtn, '✔ 已打开');
-                        // 在新标签页打开 ZenMark
-                        GM_openInTab(result.url, { active: true, insert: true });
+                        openZenMarkTab(result.url);
                         markTiming('tabOpened');
                         logTiming({ payloadChars: text.length });
                     } else {
-                        throw new Error(result.error || `接口返回异常 (${response.status})`);
+                        throw new Error(result.error || `接口返回异常 (${status})`);
                     }
                 } catch (e) {
                     console.error('[ZenMark TM 错误]', e);
                     logTiming({ payloadChars: text.length, error: String(e.message || e) });
-                    alert('发送失败：' + (e.message || response.responseText));
+                    alert('发送失败：' + (e.message || responseText));
                     finishStatus(sourceBtn, '❌ 失败');
                 }
                 setTimeout(() => setBtnStatus(sourceBtn, '📖 ZenMark'), 2000);
@@ -540,17 +584,13 @@
     window.__zenmarkNetTest = function() {
         return new Promise(resolve => {
             const started = performance.now();
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: ZENMARK_API_URL,
-                headers: { 'Content-Type': 'application/json; charset=utf-8' },
-                data: JSON.stringify({
-                    text: '# ZenMark 网络自测\n\n' + new Date().toISOString(),
-                    title: 'ZenMark 网络自测',
-                    autoRead: false
-                }),
+            httpPostJSON(ZENMARK_API_URL, JSON.stringify({
+                text: '# ZenMark 网络自测\n\n' + new Date().toISOString(),
+                title: 'ZenMark 网络自测',
+                autoRead: false
+            }), {
                 timeout: 60000,
-                onload: r => resolve({ ok: r.status === 200, ms: Math.round(performance.now() - started), status: r.status }),
+                onload: (status) => resolve({ ok: status === 200, ms: Math.round(performance.now() - started), status: status }),
                 onerror: () => resolve({ ok: false, ms: Math.round(performance.now() - started), error: 'network' }),
                 ontimeout: () => resolve({ ok: false, ms: Math.round(performance.now() - started), error: 'timeout' })
             });
@@ -962,6 +1002,25 @@
     /**
      * 诊断：控制台执行 __zenmarkAIDiag()
      */
+    window.__zenmarkStatus = function() {
+        const host = window.location.hostname;
+        let site = 'unknown';
+        if (isGoogleSearch()) site = 'google-ai-mode';
+        else if (host.indexOf('yuanbao.tencent.com') !== -1) site = 'yuanbao';
+        else if (host.indexOf('kimi') !== -1) site = 'kimi';
+        else if (host.indexOf('gemini.google.com') !== -1) site = 'gemini';
+        else if (host.indexOf('deepseek.com') !== -1) site = 'deepseek';
+        return {
+            version: ZENMARK_SCRIPT_VERSION,
+            site: site,
+            url: window.location.href,
+            injectedButtons: document.querySelectorAll('.ai-zenmark-btn').length,
+            hasGM: typeof GM_xmlhttpRequest === 'function',
+            hasUnsafeWindow: typeof unsafeWindow !== 'undefined',
+            lastRun: window.__zenmarkLastRun || null
+        };
+    };
+
     window.__zenmarkAIDiag = function() {
         if (!isGoogleSearch()) return { note: '当前不是 google.com/search 页面' };
         const targets = collectAIModeTargets();
@@ -979,6 +1038,62 @@
         };
     };
 
+
+    // ================= 导出到页面主世界（供浏览器控制台使用） ================= //
+    // Tampermonkey 在 Chrome MV3 下默认运行在沙箱（isolated world），
+    // 脚本里的 window 与 DevTools 控制台里的 window 不是同一个对象，
+    // 因此必须显式导出到 unsafeWindow，控制台才能直接调用。
+
+    function exposeDiagnostics() {
+        let host = null;
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow) host = unsafeWindow;
+        } catch (e) { /* 某些模式下访问 unsafeWindow 会抛错 */ }
+        if (!host || host === window) return false;
+
+        host.__zenmarkScriptVersion = ZENMARK_SCRIPT_VERSION;
+        host.__zenmarkStatus = window.__zenmarkStatus;
+        host.__zenmarkDiag = window.__zenmarkDiag;
+        host.__zenmarkNetTest = window.__zenmarkNetTest;
+        host.__zenmarkAIDiag = window.__zenmarkAIDiag;
+        host.__zenmarkInstances = window.__zenmarkInstances;
+        host.__zenmarkShowDiag = showDiagOnPage;
+        return true;
+    }
+
+    /**
+     * 页面浮层诊断：控制台执行 __zenmarkShowDiag()，结果直接显示在页面上，
+     * 完全不依赖控制台上下文。
+     */
+    function showDiagOnPage() {
+        try {
+            const parts = [];
+            if (typeof window.__zenmarkStatus === 'function') parts.push(window.__zenmarkStatus());
+            if (isGoogleSearch() && typeof window.__zenmarkAIDiag === 'function') {
+                parts.push(window.__zenmarkAIDiag());
+            }
+            const text = JSON.stringify(parts.length === 1 ? parts[0] : parts, null, 2);
+
+            let box = document.getElementById('zenmark-diag-box');
+            if (!box) {
+                box = document.createElement('pre');
+                box.id = 'zenmark-diag-box';
+                box.style.cssText = 'position:fixed;right:12px;bottom:12px;max-width:420px;max-height:50vh;overflow:auto;' +
+                    'background:#111;color:#0f0;font:12px/1.5 monospace;padding:12px;border-radius:8px;z-index:2147483647;' +
+                    'white-space:pre-wrap;box-shadow:0 8px 24px rgba(0,0,0,.4);cursor:pointer;';
+                box.title = '点击关闭';
+                box.addEventListener('click', () => box.remove());
+                document.body.appendChild(box);
+            }
+            box.textContent = text;
+            return text;
+        } catch (e) {
+            console.error('[ZenMark TM] 诊断输出失败', e);
+            return String(e && e.message || e);
+        }
+    }
+
+    window.__zenmarkShowDiag = showDiagOnPage;
 
     // ================= 页面元素查找与注入 ================= //
 
@@ -1053,6 +1168,9 @@
         childList: true,
         subtree: true
     });
+
+    // 把诊断接口导出到页面主世界（在控制台使用前完成）
+    exposeDiagnostics();
 
     // 首次注入 + 兜底延迟注入（页面可能已渲染完成或异步挂载）
     injectButtons();
