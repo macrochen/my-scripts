@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>安装 / 更新 ZenMark 脚本</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 760px; margin: 40px auto; padding: 0 20px; color: #1f2328;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #0d1117; color: #e6edf3; } a { color: #58a6ff; } }
+  h1 { font-size: 22px; margin-bottom: 6px; }
+  h2 { font-size: 16px; margin-top: 32px; }
+  .meta { color: #6e7781; font-size: 13px; margin-bottom: 24px; }
+  code { background: rgba(110,118,129,.15); padding: 2px 5px; border-radius: 4px; font-size: 13px; }
+  pre { background: rgba(110,118,129,.12); padding: 12px 14px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  .install {
+    display: inline-block; margin-top: 8px; padding: 11px 22px; border-radius: 8px;
+    background: #10b981; color: #fff; font-weight: 600; text-decoration: none; font-size: 15px;
+  }
+  .install:hover { background: #0ea371; }
+  ol li, ul li { margin: 6px 0; }
+  .warn { border-left: 3px solid #f59e0b; padding: 4px 0 4px 14px; margin: 18px 0; }
+</style>
+
+<h1>安装 / 更新：AI 回答发送到 ZenMark</h1>
+<p class="meta">当前版本 <strong id="ver">读取中…</strong> · 支持 DeepSeek / Kimi / Gemini / 腾讯元宝 / Google AI Mode</p>
+
+<p><a class="install" id="installBtn" href="https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/zenmark-ai-sender.user.js">一键安装 / 更新</a></p>
+
+<div class="warn">
+  如果点击后浏览器只是把代码显示成文本，说明 Tampermonkey 没有接管这个链接。请改用下面的「手动安装方式」。
+</div>
+
+<h2>手动安装方式（最可靠）</h2>
+<ol>
+  <li>点击下面的按钮，把脚本全文复制到剪贴板。</li>
+  <li>打开 Tampermonkey 图标 →「管理面板」。</li>
+  <li>在左侧/顶部找到「AI 回答发送到 ZenMark …」，<strong>直接删除旧的那条</strong>（避免两份副本冲突）。</li>
+  <li>点「+ 添加新脚本」，全选编辑器内容（<code>Ctrl/Cmd + A</code>），粘贴覆盖，然后 <code>Ctrl/Cmd + S</code> 保存。</li>
+  <li>回到 AI Mode 页面<strong>刷新一次</strong>，控制台执行 <code>__zenmarkInstances</code> 验证。</li>
+</ol>
+<p><button class="install" id="copyBtn" style="border:0;cursor:pointer">复制脚本全文</button></p>
+
+<h2>验证是否装上</h2>
+<ol>
+  <li>Tampermonkey 图标 → 该脚本，右上角「版本」应显示 <code id="ver2">1.4.1</code>；</li>
+  <li>页面控制台执行 <code>__zenmarkInstances</code>，应返回一个包含 <code>"version": "1.4.1"</code> 的数组；</li>
+  <li>再执行 <code>__zenmarkAIDiag()</code> 查看 AI Mode 的回答识别情况。</li>
+</ol>
+
+<script>
+  const RAW = 'https://raw.githubusercontent.com/macrochen/my-scripts/main/userscripts/zenmark-ai-sender.user.js';
+  fetch(RAW, { cache: 'no-store' })
+    .then(r => r.text())
+    .then(text => {
+      const m = text.match(/@version\s+(\S+)/);
+      const v = m ? m[1] : '未知';
+      document.getElementById('ver').textContent = v;
+      document.getElementById('ver2').textContent = v;
+      // 用 blob 链接，Chromium 落地后会以 .user.js 交给 Tampermonkey 处理
+      const blob = new Blob([text], { type: 'text/javascript' });
+      document.getElementById('installBtn').href = URL.createObjectURL(blob);
+      document.getElementById('installBtn').download = 'zenmark-ai-sender.user.js';
+    })
+    .catch(() => { document.getElementById('ver').textContent = '读取失败，请稍后重试'; });
+
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('copyBtn');
+    try {
+      const text = await fetch(RAW, { cache: 'no-store' }).then(r => r.text());
+      await navigator.clipboard.writeText(text);
+      btn.textContent = '已复制 ✓ 去 Tampermonkey 粘贴';
+    } catch (e) {
+      btn.textContent = '复制失败，请手动打开 raw 链接';
+    }
+  });
+</script>
