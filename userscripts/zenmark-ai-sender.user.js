@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.7
+// @version      1.5.8
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.7';
+    const ZENMARK_SCRIPT_VERSION = '1.5.8';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -346,8 +346,7 @@
         btn.textContent = '📖 ZenMark';
         btn.className = 'ai-zenmark-btn icon-button';
         btn.type = 'button';
-        // 定位为浮层兄弟元素：不参与父级 flex 布局，不会挤压/换行/被缩放。
-        // 位置由 wrapButtonOver 依据复制按钮的实际位置计算。
+        // 基础样式在插入时按“行内 / 浮层”两套方案设置（见 INLINE_BTN_CSS / OVERLAY_BTN_CSS）
         btn.style.cssText = `
             cursor: pointer;
             display: inline-flex;
@@ -657,6 +656,19 @@
     //     div[aria-label='正在复制']               ← 复制中的提示节点
     //     button[aria-label='分享' / '赞' / '踩' / '更多']
     // 因此这里按“工具栏”为单位定位，而不是写死某个类名。
+
+    // 按钮基础外观（两种放置方式共用）
+    const BTN_BASE_CSS = 'cursor:pointer;display:inline-flex;align-items:center;justify-content:center;' +
+        'box-sizing:border-box;font-size:12px;line-height:16px;height:22px;color:#10b981;font-weight:600;' +
+        'user-select:none;white-space:nowrap;background:rgba(16,185,129,0.08);' +
+        'border:1px solid rgba(16,185,129,0.35);border-radius:6px;padding:0 7px;';
+
+    // 行内放置：参与工具栏布局，但禁止被压缩或换行
+    const INLINE_BTN_CSS = BTN_BASE_CSS +
+        'flex:0 0 auto;flex-shrink:0;align-self:center;margin-left:8px;vertical-align:middle;';
+
+    // 浮层放置：脱离布局
+    const OVERLAY_BTN_CSS = BTN_BASE_CSS + 'position:fixed;pointer-events:auto;';
 
     // 留空；确认结构后可追加精确选择器（例如 '[data-xid="aim-answer"]'）
     const AI_MODE_EXTRA_SELECTORS = [];
@@ -1266,10 +1278,63 @@
      * - 用一个 fixed 定位的外层容器，位置跟随复制按钮实时计算
      * - 不插入到 Google 的工具栏内部，因此不会影响原有布局（不换行、不缩放）
      */
-    function wrapButtonOver(anchor, btn) {
-        // 外层：固定定位，紧贴在复制按钮右下方
-        btn.style.position = 'fixed';
-        btn.style.pointerEvents = 'auto';
+    function placeButton(anchor, btn) {
+        // 优先：直接插进工具栏这一行（与复制/分享/赞/踩/更多同一排，
+        // 位于最后一个图标按钮之后，也就是页面上那片空白处）。
+        if (tryInlinePlacement(anchor, btn)) return;
+
+        // 兜底：插进去后布局异常（换行、被压缩），退回浮层，不影响 Google 原布局
+        placeButtonOverlay(anchor, btn);
+    }
+
+    /**
+     * 尝试把按钮插入工具栏行内。
+     * 真实 DOM 里工具栏常有「图标按钮 + 包装层」的结构，
+     * 所以往上找到“与复制按钮同一行的容器”再追加，而不是紧跟复制按钮。
+     */
+    function tryInlinePlacement(anchor, btn) {
+        const bar = anchor.parentElement;
+        if (!bar) return false;
+
+        // 同一条工具栏行：优先找包含多个图标按钮的那一层
+        let row = null;
+        let el = bar;
+        for (let depth = 0; el && depth < 4; depth++, el = el.parentElement) {
+            if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+            const iconButtons = el.querySelectorAll(':scope > *, :scope > div > button, :scope > div > div > button');
+            if (iconButtons.length >= 2 && !spansMultipleAnswers(el)) {
+                row = el;
+                break;
+            }
+        }
+        if (!row) return false;
+
+        // 记录插入前的布局基线
+        const before = row.getBoundingClientRect();
+        const anchorRect = anchor.getBoundingClientRect();
+
+        btn.style.cssText = INLINE_BTN_CSS;
+        row.appendChild(btn);
+
+        // 校验：按钮必须与复制按钮在同一行，且没有被压扁
+        const after = row.getBoundingClientRect();
+        const btnRect = btn.getBoundingClientRect();
+        const sameRow = Math.abs(btnRect.top - anchorRect.top) <= Math.max(6, anchorRect.height / 2);
+        const notSquashed = btnRect.width >= 60 && btnRect.height >= 18;
+        const rowGrew = after.height > before.height + 4;
+
+        if (sameRow && notSquashed && !rowGrew) return true;
+
+        // 布局异常：撤销并返回失败
+        btn.remove();
+        return false;
+    }
+
+    /**
+     * 浮层方式：不参与 Google 布局，位置跟随复制按钮
+     */
+    function placeButtonOverlay(anchor, btn) {
+        btn.style.cssText = OVERLAY_BTN_CSS;
         document.body.appendChild(btn);
 
         const reposition = () => {
@@ -1279,7 +1344,6 @@
                 return;
             }
             const r = anchor.getBoundingClientRect();
-            // 视口内不可见时隐藏，避免按钮停在不相关的位置
             if (r.bottom < 0 || r.top > window.innerHeight || r.width === 0) {
                 btn.style.visibility = 'hidden';
                 return;
@@ -1333,8 +1397,8 @@
                 ? '发送到 ZenMark（只发送回答）'
                 : (info.copy.turn ? '发送到 ZenMark（使用 Google 复制本条回答）' : '发送到 ZenMark（自动转换为 Markdown）');
 
-            // 用浮层方式挂载：不占用工具栏的布局空间
-            wrapButtonOver(anchor, btn);
+            // 优先放回工具栏同一行；失败则退回浮层
+            placeButton(anchor, btn);
         });
     }
 
