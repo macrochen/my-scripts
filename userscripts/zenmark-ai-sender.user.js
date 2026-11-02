@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.4.4
+// @version      1.5.0
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.4.4';
+    const ZENMARK_SCRIPT_VERSION = '1.5.0';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -670,12 +670,34 @@
      */
     function candidateToolbars() {
         const map = new Map();
-        const anchors = AI_MODE_EXTRA_SELECTORS.length
-            ? Array.from(document.querySelectorAll(AI_MODE_EXTRA_SELECTORS.join(',')))
-            : Array.from(document.querySelectorAll('[aria-label]'));
+        if (AI_MODE_EXTRA_SELECTORS.length) {
+            document.querySelectorAll(AI_MODE_EXTRA_SELECTORS.join(',')).forEach(el => {
+                if (el.parentElement) map.set(el.parentElement, true);
+            });
+            return Array.from(map.keys());
+        }
+
+        // 真实结构：复制按钮常被单独包一层（如 <div><button aria-label="复制文字"/></div>），
+        // 所以把“复制类按钮的父节点”和“父节点的父节点”都作为候选工具栏。
+        const anchors = Array.from(document.querySelectorAll('[aria-label]'))
+            .filter(el => AI_COPY_LABEL_RE.test(labelOf(el)));
+        if (!anchors.length) {
+            // 该版 AI Mode 若去掉了复制按钮：退化为“含 2 个以上图标按钮的紧凑按钮组”
+            document.querySelectorAll('[aria-label], button, [role="button"]').forEach(el => {
+                const p = el.parentElement;
+                if (!p) return;
+                const kids = Array.from(p.children).filter(isButtonLike);
+                if (kids.length < 2) return;
+                const labeled = kids.filter(k => AI_TOOLBAR_LABEL_RE.test(labelOf(k)));
+                if (labeled.length >= 2) map.set(p, true);
+            });
+            return Array.from(map.keys());
+        }
+
         anchors.forEach(el => {
-            if (!el.parentElement) return;
-            map.set(el.parentElement, true);
+            if (el.parentElement) map.set(el.parentElement, true);
+            const gp = el.parentElement && el.parentElement.parentElement;
+            if (gp && /^(DIV|SECTION|ARTICLE|LI)$/.test(gp.tagName)) map.set(gp, true);
         });
         return Array.from(map.keys());
     }
@@ -722,7 +744,51 @@
             if (hasOtherToolbar(el, bar)) continue;
             return { container: el, reason: 'depth-' + depth };
         }
+        return findSiblingAnswer(bar);
+    }
+
+    /**
+     * 兜底：工具栏与正文不是同一父级时（懒加载 / 浮动布局）。
+     * 思路：在整页里收集“实质正文块”，选与工具栏最近（公共祖先最深）的那块。
+     */
+    function findSiblingAnswer(bar) {
+        const main = document.querySelector('[role="main"]') || document.body;
+
+        const candidates = Array.from(main.querySelectorAll('div, section, article'))
+            .filter(el => !el.querySelector('.ai-zenmark-btn'))
+            .filter(el => !el.contains(bar))
+            .filter(el => hasSubstantialAnswer(el) && !hasOtherToolbar(el, el));
+
+        if (!candidates.length) return null;
+
+        let best = null;
+        let bestDepth = -1;
+        candidates.forEach(el => {
+            const common = lowestCommonAncestor(el, bar);
+            if (!common) return;
+            const depth = depthOf(common);
+            if (depth > bestDepth) {
+                bestDepth = depth;
+                best = el;
+            }
+        });
+
+        return best ? { container: best, reason: 'lca-' + bestDepth } : null;
+    }
+
+    function lowestCommonAncestor(a, b) {
+        const seen = new Set();
+        for (let el = a; el; el = el.parentElement) seen.add(el);
+        for (let el = b; el; el = el.parentElement) {
+            if (seen.has(el)) return el;
+        }
         return null;
+    }
+
+    function depthOf(el) {
+        let d = 0;
+        while (el && el.parentElement) { d++; el = el.parentElement; }
+        return d;
     }
 
     function stripChrome(el) {
