@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.5
+// @version      1.5.6
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.5';
+    const ZENMARK_SCRIPT_VERSION = '1.5.6';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -777,11 +777,42 @@
         let el = bar.parentElement;
         for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
             if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+            // 硬约束：跨越多条回答的外层容器不能作为回答容器
+            if (spansMultipleAnswers(el)) continue;
             if (!hasSubstantialAnswer(el)) continue;
             if (hasOtherToolbar(el, bar)) continue;
             return { container: el, reason: 'depth-' + depth };
         }
         return findSiblingAnswer(bar);
+    }
+
+    /**
+     * 统计某元素内“复制类按钮”的数量（用于排除跨回答的外层容器）
+     */
+    function countCopyButtons(el) {
+        let n = 0;
+        el.querySelectorAll('[aria-label]').forEach(x => {
+            if (AI_COPY_LABEL_RE.test(labelOf(x))) n++;
+        });
+        return n;
+    }
+
+    /**
+     * 该容器是否跨越了多条回答。
+     * 同一条回答里可能同时有「复制“问题”」和「复制文字」，
+     * 所以判定标准是“出现 ≥2 个「复制文字」”或“出现 ≥2 个「复制“问题”」”，
+     * 而不是简单地数复制按钮个数。
+     */
+    function spansMultipleAnswers(el) {
+        let textCount = 0;
+        let turnCount = 0;
+        el.querySelectorAll('[aria-label]').forEach(x => {
+            const label = labelOf(x);
+            if (/^复制文字$|^copy\s+text$/i.test(label)) textCount++;
+            else if (/^复制\s*[“"]/.test(label)) turnCount++;
+            else if (AI_COPY_LABEL_RE.test(label)) textCount++;
+        });
+        return textCount >= 2 || turnCount >= 2;
     }
 
     /**
@@ -842,10 +873,8 @@
         for (let depth = 0; el && depth < 10; depth++, el = el.parentElement) {
             if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
 
-            // 不能包含另一条回答的复制按钮
-            const otherCopies = Array.from(el.querySelectorAll('[aria-label]'))
-                .filter(x => AI_COPY_LABEL_RE.test(labelOf(x)) && !x.contains(btn) && x !== btn);
-            if (otherCopies.length) continue;
+            // 不能跨越另一条回答
+            if (spansMultipleAnswers(el)) continue;
 
             if (!hasSubstantialAnswer(el)) continue;
             return { container: el, reason: 'copy-anchor-' + depth };
@@ -863,6 +892,7 @@
         const candidates = Array.from(main.querySelectorAll('div, section, article'))
             .filter(el => !el.querySelector('.ai-zenmark-btn'))
             .filter(el => !el.contains(bar))
+            .filter(el => !spansMultipleAnswers(el))
             .filter(el => hasSubstantialAnswer(el) && !hasOtherToolbar(el, el));
 
         if (!candidates.length) return null;
@@ -1154,6 +1184,18 @@
             copyButtons.forEach(el => {
                 const bar = el.parentElement;
                 if (!bar) return;
+
+                // 「复制“问题”」这类整轮复制按钮只作为补充信息，
+                // 不作为独立锚点（提问行也有它，会造成重复注入）。
+                const isTurnCopy = /^复制\s*[“"]/.test(labelOf(el));
+                if (isTurnCopy) {
+                    // 仅当同一工具栏里找不到“复制文字”时，才用它兜底
+                    const siblingText = bar.parentElement
+                        ? Array.from(bar.parentElement.querySelectorAll('[aria-label]'))
+                            .find(x => /^复制文字$|^copy\s+text$/i.test(labelOf(x)))
+                        : null;
+                    if (siblingText) return;
+                }
 
                 // 先按“工具栏与正文同父级”匹配（旧结构），失败再用复制按钮锚点匹配
                 const answer = findAnswerFor(bar, [el]) || findAnswerForCopyButton(el);
