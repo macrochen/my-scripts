@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.2
+// @version      1.5.3
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.2';
+    const ZENMARK_SCRIPT_VERSION = '1.5.3';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -595,6 +595,38 @@
                 ontimeout: () => resolve({ ok: false, ms: Math.round(performance.now() - started), error: 'timeout' })
             });
         });
+    };
+
+    /**
+     * 分步自检：手动触发一次 AI Mode 注入，并返回每一步的结果。
+     * 用于区分“注入没执行”与“执行了但识别不到”。
+     */
+    window.__zenmarkTryInject = function() {
+        const steps = {};
+        try {
+            steps.isGoogleSearch = isGoogleSearch();
+            steps.isAIModePage = isAIModePage();
+            steps.urlParams = {
+                udm: new URLSearchParams(location.search).get('udm'),
+                path: location.pathname,
+                host: location.host
+            };
+            steps.copyButtons = Array.from(document.querySelectorAll('[aria-label]'))
+                .filter(el => AI_COPY_LABEL_RE.test(labelOf(el)))
+                .map(el => el.getAttribute('aria-label'));
+            steps.targets = collectAIModeTargets().map(t => ({
+                reason: t.answer.reason,
+                copyText: t.copy.text ? labelOf(t.copy.text) : null,
+                containerCls: (t.answer.container.className || '').toString().slice(0, 40)
+            }));
+            steps.buttonsBefore = document.querySelectorAll('.ai-zenmark-btn').length;
+            injectAIModeButtons();
+            steps.buttonsAfter = document.querySelectorAll('.ai-zenmark-btn').length;
+            steps.error = null;
+        } catch (e) {
+            steps.error = String(e && e.stack || e);
+        }
+        return steps;
     };
 
     // 元宝诊断入口：控制台执行 __zenmarkDiag()（AI Mode 的诊断见 __zenmarkAIDiag）
@@ -1316,6 +1348,7 @@
         host.__zenmarkInstances = window.__zenmarkInstances;
         host.__zenmarkShowDiag = showDiagOnPage;
         host.__zenmarkDumpDOM = dumpAIModeDOM;
+        host.__zenmarkTryInject = window.__zenmarkTryInject;
         return true;
     }
 
