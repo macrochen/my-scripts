@@ -1,15 +1,13 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.5.1
+// @version      1.5.2
 // @author       Ace & Macro
 // @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：统一走 Google AI 模式按链接总结。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/watch*
 // @match        https://youtube.com/watch*
-// @exclude      https://www.youtube.com/*
-// @exclude      https://youtube.com/*
 // @match        https://www.google.com/search*
 // @match        https://chat.deepseek.com/*
 // @match        https://chatgpt.com/*
