@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页 AI 总结 (页面内容 → 多模型)
 // @namespace    https://github.com/macrochen/my-scripts
-// @version      1.1.0
+// @version      1.3.0
 // @author       Macro
 // @description  屏幕右侧中间添加悬浮按钮：抓取当前网页正文（Readability + Turndown，做法参考 EasyCopy；有选中内容时优先用选中内容），转成 Markdown 后打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入提示词、自动发送。
 // @match        *://*/*
@@ -65,13 +65,28 @@
             hosts: ['chat.deepseek.com'],
             name: 'DeepSeek',
             url: 'https://chat.deepseek.com/',
-            inputSelectors: ['textarea#chat-input', '#chat-input', 'textarea', 'div[contenteditable="true"]'],
+            // 2026-11 实测：输入框是无 id 的 textarea（placeholder="Message DeepSeek"），
+            // 发送按钮是图标按钮 div[role=button].ds-button--circle，没有 aria-label，内容为空时带 ds-button--disabled
+            inputSelectors: [
+                'textarea[placeholder*="Message"]',
+                'textarea#chat-input',
+                '#chat-input',
+                'textarea',
+                'div[contenteditable="true"]'
+            ],
             sendSelectors: [
+                'div[role="button"].ds-button--circle:not(.ds-button--disabled)',
+                'div[role="button"].ds-button--primary:not(.ds-button--disabled)',
                 'div[role="button"][aria-label*="发送"]',
                 'div[role="button"][aria-label*="Send"]',
                 'button[aria-label*="发送"]',
                 'button[aria-label*="Send"]',
                 'button[type="submit"]'
+            ],
+            // 禁用的兜底：找到按钮但不点，等它变可用
+            disabledSelectors: [
+                'div[role="button"].ds-button--circle.ds-button--disabled',
+                'div[role="button"].ds-button--primary.ds-button--disabled'
             ]
         },
         {
@@ -92,7 +107,8 @@
                 'button[aria-label*="Send"]',
                 'button[aria-label*="发送"]',
                 'button[type="submit"]'
-            ]
+            ],
+            disabledSelectors: ['button[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="发送"]'],
         },
         {
             id: 'kimi',
@@ -105,7 +121,8 @@
                 'button[aria-label*="Send"]',
                 'button[type="submit"]',
                 '[class*="send"]'
-            ]
+            ],
+            disabledSelectors: ['[class*="send"]'],
         },
         {
             id: 'doubao',
@@ -119,7 +136,8 @@
                 'button[aria-label*="Send"]',
                 'button[type="submit"]',
                 '[class*="send"]'
-            ]
+            ],
+            disabledSelectors: ['button[data-testid="chat_input_send_button"]', '[class*="send"]'],
         },
         {
             id: 'qianwen',
@@ -132,7 +150,8 @@
                 'button[aria-label*="Send"]',
                 'button[type="submit"]',
                 '[class*="send"]'
-            ]
+            ],
+            disabledSelectors: ['[class*="send"]'],
         },
         {
             id: 'yuanbao',
@@ -153,7 +172,8 @@
                 'button[aria-label*="发送"]',
                 'button[aria-label*="Send"]',
                 'button[type="submit"]'
-            ]
+            ],
+            disabledSelectors: ['#yuanbao-send-btn', '[class*="send"]'],
         }
     ];
 
@@ -1022,82 +1042,139 @@
         });
     }
 
-    function fillProviderInput(input, text) {
-        input.focus();
-
-        if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
-            const proto = input.tagName === 'TEXTAREA'
-                ? window.HTMLTextAreaElement.prototype
-                : window.HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (setter) setter.call(input, text);
-            else input.value = text;
-
+    // 派发 React/Vue 能识别的 input 事件
+    function dispatchInputEvents(input, value) {
+        try {
             input.dispatchEvent(new InputEvent('input', {
                 bubbles: true,
-                cancelable: true,
+                cancelable: true,      // React 的受控组件依赖 cancelable
                 inputType: 'insertText',
-                data: text
+                data: null
             }));
+        } catch (e) { /* ignore */ }
+        try {
+            input.dispatchEvent(new Event('input', { bubbles: true }));   // 再补一个普通事件
+        } catch (e) { /* ignore */ }
+        try {
             input.dispatchEvent(new Event('change', { bubbles: true }));
-            if (input.setSelectionRange) input.setSelectionRange(text.length, text.length);
-            return;
+        } catch (e) { /* ignore */ }
+    }
+
+    function setTextareaValue(input, value) {
+        const proto = input.tagName === 'TEXTAREA'
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        try {
+            if (setter) setter.call(input, value);   // 绕过 React 的 value 劫持，才能让输入事件生效
+            else input.value = value;
+        } catch (e) {
+            input.value = value;
+        }
+        dispatchInputEvents(input);
+        try { if (input.setSelectionRange) input.setSelectionRange(value.length, value.length); } catch (e) { /* ignore */ }
+    }
+
+    // 方式 1：原生 setter + input 事件（对 textarea 最可靠）
+    // 方式 2：execCommand('insertText')（模拟真实输入，contenteditable 和部分受控组件认这个）
+    // 方式 3：直接赋值
+    // 返回最终是否填入成功
+    function fillProviderInput(input, text) {
+        try { input.focus(); } catch (e) { /* ignore */ }
+
+        const isField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
+
+        if (isField) {
+            setTextareaValue(input, text);
+            if ((input.value || '').length >= text.length) return true;
         }
 
-        // contenteditable / ProseMirror
-        let inserted = false;
+        // contenteditable 及 textarea 的补充路径：选中全部后插入文本
         try {
             const selection = window.getSelection();
             const range = document.createRange();
             range.selectNodeContents(input);
             selection.removeAllRanges();
             selection.addRange(range);
-            inserted = document.execCommand('insertText', false, text);
-        } catch (e) {
-            inserted = false;
+            document.execCommand('insertText', false, text);
+        } catch (e) { /* ignore */ }
+
+        if (!isField && getInputText(input).trim().length > 0) {
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
         }
 
-        if (!inserted || !(input.textContent || '').trim()) {
-            try {
-                const dataTransfer = new DataTransfer();
-                dataTransfer.setData('text/plain', text);
-                input.dispatchEvent(new ClipboardEvent('paste', {
-                    bubbles: true,
-                    cancelable: true,
-                    clipboardData: dataTransfer
-                }));
-            } catch (e) { /* ignore */ }
+        // 粘贴事件兜底（ProseMirror / 富文本编辑器常用）
+        try {
+            const dataTransfer = new DataTransfer();
+            dataTransfer.setData('text/plain', text);
+            input.dispatchEvent(new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dataTransfer
+            }));
+        } catch (e) { /* ignore */ }
+
+        if (getInputText(input).trim().length > 0) {
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
         }
 
-        if (!(input.textContent || '').trim()) {
+        // 最后兜底：直接写 DOM 文本
+        if (!isField) {
             try {
                 input.innerText = text;
                 if (!(input.textContent || '').trim()) input.textContent = text;
             } catch (e) {
                 input.textContent = text;
             }
+            input.dispatchEvent(new Event('input', { bubbles: true }));
         }
 
-        input.dispatchEvent(new InputEvent('input', {
-            bubbles: true,
-            cancelable: true,
-            inputType: 'insertText',
-            data: text
-        }));
+        return getInputText(input).length >= Math.min(10, text.length);
+    }
+
+    // 返回所有候选发送按钮（可见的），按选择器优先级排序
+    function collectSendCandidates(provider) {
+        const out = [];
+        const push = (node) => {
+            if (node && !out.includes(node) && isElementVisible(node)) out.push(node);
+        };
+
+        (provider.sendSelectors || []).forEach(selector => {
+            try { document.querySelectorAll(selector).forEach(push); } catch (e) { /* ignore */ }
+        });
+        // 页面上可能有多个发送按钮（如"深度思考"等开关也是圆按钮），这里按"离输入框最近"再排一次
+        const input = findProviderInput(provider);
+        if (input && out.length > 1) {
+            const rect = input.getBoundingClientRect();
+            const centerY = rect.top + rect.height / 2;
+            out.sort((a, b) => {
+                const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                return Math.abs(ra.top - centerY) - Math.abs(rb.top - centerY);
+            });
+        }
+        return out;
+    }
+
+    function isSendDisabled(node) {
+        if (!node) return true;
+        if (node.disabled) return true;
+        if (node.getAttribute('aria-disabled') === 'true') return true;
+        const cls = String(node.className || '');
+        // DeepSeek 等组件库用 is-disabled / --disabled 修饰类
+        if (/(^|[\s_-])is-disabled|--disabled/.test(cls)) return true;
+        return false;
     }
 
     function findProviderSendButton(provider) {
-        for (const selector of provider.sendSelectors || []) {
-            try {
-                const picked = pickVisible(document.querySelectorAll(selector));
-                if (picked && picked.getAttribute('aria-disabled') !== 'true') return picked;
-            } catch (e) { /* ignore */ }
+        for (const node of collectSendCandidates(provider)) {
+            if (!isSendDisabled(node)) return node;
         }
-
+        // 选择器命中不到时，回退到按文字/aria-label 找
         const generic = Array.from(document.querySelectorAll('button, [role="button"]'));
         for (const node of generic) {
-            if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
-            if (!isElementVisible(node)) continue;
+            if (isSendDisabled(node) || !isElementVisible(node)) continue;
             const label = (
                 (node.getAttribute('aria-label') || '') + ' ' +
                 (node.getAttribute('title') || '') + ' ' +
@@ -1106,6 +1183,35 @@
             if (/发送|send|submit/.test(label)) return node;
         }
         return null;
+    }
+
+    // 发送按钮是否"存在但禁用"。用页面上的结构特征判断，而不是只看供应商配置：
+    // 选了发送相关的元素后，如果它带 disabled / aria-disabled / --disabled 修饰类，就认为没生效。
+    function sendButtonIsDisabled() {
+        const markers = [
+            'button[type="submit"]',
+            'button[aria-label*="发送"]',
+            'button[aria-label*="Send"]',
+            'div[role="button"][aria-label*="发送"]',
+            'div[role="button"][aria-label*="Send"]',
+            '[data-testid*="send"]',
+            '[class*="send" i]',
+            // DeepSeek：发送按钮是无 aria-label 的圆形图标按钮，只能用组件的禁用修饰类识别
+            'div[role="button"].ds-button--circle',
+            'div[role="button"].ds-button--primary'
+        ];
+        const nodes = [];
+        markers.forEach(sel => {
+            try { document.querySelectorAll(sel).forEach(n => nodes.push(n)); } catch (e) { /* ignore */ }
+        });
+        return nodes.some(node => isElementVisible(node) && isSendDisabled(node));
+    }
+
+    // 检查输入框里是否真的填进了内容（前端框架接管后可能清空）
+    function getInputText(input) {
+        if (!input) return '';
+        if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') return input.value || '';
+        return input.innerText || input.textContent || '';
     }
 
     function pressEnter(input) {
@@ -1124,33 +1230,74 @@
 
     function fillAndSendProvider(provider, input, text, autoSend) {
         console.info('[网页AI] 开始填充:', provider.name, '长度:', text.length);
-        fillProviderInput(input, text);
+
+        let filled = fillProviderInput(input, text);
+        const isField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
+        const inputValue = () => (isField ? (input.value || '') : getInputText(input));
+
+        // 部分组件是异步处理输入的：再确认一次
+        if (!filled) {
+            setTimeout(() => {
+                if (inputValue().length < Math.min(10, text.length)) {
+                    console.warn('[网页AI] 输入框仍为空');
+                    fillProviderInput(input, text);
+                }
+            }, 200);
+        }
 
         if (!autoSend) {
             showInfoBar('内容已填入（自动发送已关闭），请检查后手动发送', 'info', 4000);
             return;
         }
 
+        // 等前端把内容写进状态、发送按钮从禁用变可用（最多约 8 秒）
         let attempts = 0;
         const timer = setInterval(() => {
             attempts++;
-
+            const hasContent = inputValue().length >= Math.min(10, text.length);
             const sendBtn = findProviderSendButton(provider);
-            if (sendBtn) {
+
+            if (hasContent && sendBtn) {
                 clearInterval(timer);
-                sendBtn.click();
+                try { sendBtn.click(); } catch (e) { /* ignore */ }
                 showInfoBar('已发送', 'success', 2000);
                 console.info('[网页AI] 已点击发送');
                 return;
             }
 
-            if (attempts >= 20) {
+            if (attempts >= 32) {
                 clearInterval(timer);
-                pressEnter(input);
-                showInfoBar('未找到发送按钮，已尝试回车', 'info', 3000);
-                console.info('[网页AI] 未找到发送按钮，尝试回车');
+                reportSendFailure(provider, input, inputValue().length, text.length);
             }
         }, 250);
+    }
+
+    // 发送失败时，明确告诉用户卡在哪一步
+    function reportSendFailure(provider, input, filledLen, expectedLen) {
+        const tooShort = filledLen < Math.min(10, expectedLen);
+        const disabled = sendButtonIsDisabled();
+
+        console.warn('[网页AI] 发送未完成', { filledLen, expectedLen, disabled });
+
+        if (tooShort) {
+            // 内容没进输入框：试一次回车，然后提示手动粘贴
+            pressEnter(input);
+            showInfoBar(`${provider.name} 的输入框没接收内容（${filledLen} 字）。总结已复制到剪贴板，请手动粘贴后发送`, 'error', 10000);
+            notify('网页 AI 总结', `没能自动填入 ${provider.name}。内容已复制到剪贴板，直接粘贴即可。`);
+            return;
+        }
+
+        if (disabled) {
+            // 内容在，但发送按钮仍旧禁用：告诉用户"差一步"，不判失败
+            pressEnter(input);
+            showInfoBar(`内容已填入，但 ${provider.name} 的发送按钮仍是灰色。若没自动发出，请手动点一下发送`, 'info', 8000);
+            return;
+        }
+
+        // 内容在、按钮可用但点不到：回车兜底
+        pressEnter(input);
+        showInfoBar('找不到发送按钮，已尝试回车；若没发出去请手动点发送', 'info', 6000);
+        console.info('[网页AI] 未找到发送按钮，尝试回车');
     }
 
     function readTask(provider) {
