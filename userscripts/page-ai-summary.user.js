@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页 AI 总结 (页面内容 → 多模型)
 // @namespace    https://github.com/macrochen/my-scripts
-// @version      1.3.0
+// @version      1.4.0
 // @author       Macro
 // @description  屏幕右侧中间添加悬浮按钮：抓取当前网页正文（Readability + Turndown，做法参考 EasyCopy；有选中内容时优先用选中内容），转成 Markdown 后打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入提示词、自动发送。
 // @match        *://*/*
@@ -231,6 +231,27 @@
     //  状态
     // ================================================================
     const HOST = location.hostname;
+
+    // ================================================================
+    //  不注入的站点：阅读器 / 视频网站（这些页面不需要 AI 总结）
+    // ================================================================
+    // 子域名匹配：xxx.com 及其任何子域
+    const EXCLUDED_DOMAINS = [
+        // 自己用的阅读器站点
+        'zenmark-bxx.pages.dev',
+        // 视频网站
+        'bilibili.com', 'b23.tv',
+        'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+        'ixigua.com', 'douyin.com', 'iesdouyin.com', 'kuaishou.com',
+        'vimeo.com', 'dailymotion.com', 'twitch.tv',
+        'iqiyi.com', 'youku.com', 'mgtv.com', 'tencentvideo.com', 'v.qq.com', 'sohu.com',
+        'acfun.cn', 'tiktok.com', 'netflix.com', 'primevideo.com', 'disneyplus.com', 'hulu.com'
+    ];
+
+    function isExcludedHost(host) {
+        const h = String(host || '').toLowerCase().replace(/^www\./, '');
+        return EXCLUDED_DOMAINS.some(d => h === d || h.endsWith('.' + d));
+    }
     let fabWrap = null;
     let providerSelect = null;
     let fabButton = null;
@@ -1228,8 +1249,16 @@
         input.dispatchEvent(new KeyboardEvent('keyup', options));
     }
 
+    function describeInput(input) {
+        if (!input) return 'null';
+        const attrs = ['id', 'placeholder', 'class', 'role']
+            .map(k => input.getAttribute && input.getAttribute(k) ? `${k}="${String(input.getAttribute(k)).slice(0, 40)}"` : '')
+            .filter(Boolean).join(' ');
+        return `<${input.tagName.toLowerCase()} ${attrs}>`;
+    }
+
     function fillAndSendProvider(provider, input, text, autoSend) {
-        console.info('[网页AI] 开始填充:', provider.name, '长度:', text.length);
+        console.info('[网页AI] 开始填充:', provider.name, '长度:', text.length, '| 匹配到的输入框:', describeInput(input), '| 输入框可见:', isElementVisible(input));
 
         let filled = fillProviderInput(input, text);
         const isField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
@@ -1260,7 +1289,7 @@
             if (hasContent && sendBtn) {
                 clearInterval(timer);
                 try { sendBtn.click(); } catch (e) { /* ignore */ }
-                showInfoBar('已发送', 'success', 2000);
+                showInfoBar('已填入并发送', 'success', 2000);
                 console.info('[网页AI] 已点击发送');
                 return;
             }
@@ -1282,7 +1311,8 @@
         if (tooShort) {
             // 内容没进输入框：试一次回车，然后提示手动粘贴
             pressEnter(input);
-            showInfoBar(`${provider.name} 的输入框没接收内容（${filledLen} 字）。总结已复制到剪贴板，请手动粘贴后发送`, 'error', 10000);
+            // 提示里带上实际看到的输入框，方便排查"没认对元素"
+            showInfoBar(`${provider.name} 的输入框没接收内容（当前 ${filledLen} 字）。若没自动发出：点一下输入框再粘贴（内容已在剪贴板）。控制台日志里有匹配到的输入框信息`, 'error', 10000);
             notify('网页 AI 总结', `没能自动填入 ${provider.name}。内容已复制到剪贴板，直接粘贴即可。`);
             return;
         }
@@ -1385,6 +1415,12 @@
                 runProviderPage(provider);
             });
         } catch (e) { /* ignore */ }
+    }
+
+    // 阅读器 / 视频站点：不挂按钮、不处理任务
+    if (isExcludedHost(HOST)) {
+        console.info('[网页AI] 当前站点在排除列表，不注入:', HOST);
+        return;
     }
 
     const currentProvider = getProviderByHost(HOST);
