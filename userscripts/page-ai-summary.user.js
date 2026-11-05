@@ -1,19 +1,13 @@
 // ==UserScript==
 // @name         网页 AI 总结 (页面内容 → 多模型)
 // @namespace    https://github.com/macrochen/my-scripts
-// @version      1.4.0
+// @version      1.5.0
 // @author       Macro
 // @description  屏幕右侧中间添加悬浮按钮：抓取当前网页正文（Readability + Turndown，做法参考 EasyCopy；有选中内容时优先用选中内容），转成 Markdown 后打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）并自动填入提示词、自动发送。
 // @match        *://*/*
-// @exclude      *://chat.deepseek.com/*
-// @exclude      *://chatgpt.com/*
-// @exclude      *://chat.openai.com/*
-// @exclude      *://*.kimi.com/*
-// @exclude      *://kimi.moonshot.cn/*
-// @exclude      *://*.doubao.com/*
-// @exclude      *://*.qianwen.com/*
-// @exclude      *://tongyi.aliyun.com/*
-// @exclude      *://yuanbao.tencent.com/*
+// 注意：目标 AI 站点（DeepSeek / ChatGPT / Kimi / 豆包 / 千问 / 元宝）**绝对不能** @exclude，
+// 否则脚本不会注入，下面的「读取任务 → 填入输入框」分支就永远不执行，表现就是"内容进不了对话框"。
+// 这些站点要不要挂悬浮按钮，由运行时分支（getProviderByHost）决定，不需要靠 @exclude。
 // @exclude      *://www.google.com/search*
 // @exclude      *://accounts.*/*
 // @exclude      *://login.*/*
@@ -58,7 +52,8 @@
     const MIN_CONTENT_CHARS = 30;          // 少于这个字符数认为没抓到内容
     const DEBUG = false;
 
-    // 想新增模型时，只需要在 PROVIDERS 里加一项，并同步加 @exclude / @connect
+    // 想新增模型时，只需要在 PROVIDERS 里加一项。注意：不要给这个域名加 @exclude，
+    // 否则脚本不会在该页面注入，自动填入会失效（AI 页面不挂按钮由运行时分支处理）。
     const PROVIDERS = [
         {
             id: 'deepseek',
@@ -1096,6 +1091,27 @@
         try { if (input.setSelectionRange) input.setSelectionRange(value.length, value.length); } catch (e) { /* ignore */ }
     }
 
+    // 模拟"真实输入"：focus + 选中已有内容 + execCommand('insertText')
+    // textarea 必须用 setSelectionRange；contenteditable 才用 Range（对 textarea 用 Range 会抛异常，
+    // 这正是之前 textarea 的兜底路径从来没生效过的原因）
+    function insertTextNative(input, text) {
+        const isField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
+        try { input.focus(); } catch (e) { /* ignore */ }
+        try {
+            if (isField) {
+                const len = (input.value || '').length;
+                if (input.setSelectionRange) input.setSelectionRange(0, len);
+            } else {
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(input);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+        } catch (e) { /* ignore */ }
+        try { return document.execCommand('insertText', false, text); } catch (e) { return false; }
+    }
+
     // 方式 1：原生 setter + input 事件（对 textarea 最可靠）
     // 方式 2：execCommand('insertText')（模拟真实输入，contenteditable 和部分受控组件认这个）
     // 方式 3：直接赋值
@@ -1110,18 +1126,16 @@
             if ((input.value || '').length >= text.length) return true;
         }
 
-        // contenteditable 及 textarea 的补充路径：选中全部后插入文本
-        try {
-            const selection = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(input);
-            selection.removeAllRanges();
-            selection.addRange(range);
-            document.execCommand('insertText', false, text);
-        } catch (e) { /* ignore */ }
+        // 补充路径：选中全部后插入文本（textarea / contenteditable 都走这里）
+        insertTextNative(input, text);
 
         if (!isField && getInputText(input).trim().length > 0) {
             input.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+        }
+
+        if (isField && (input.value || '').length >= Math.min(10, text.length)) {
+            dispatchInputEvents(input);
             return true;
         }
 
@@ -1264,14 +1278,25 @@
         const isField = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT';
         const inputValue = () => (isField ? (input.value || '') : getInputText(input));
 
-        // 部分组件是异步处理输入的：再确认一次
+        // 受控组件（React/Vue）常常在下一帧用自身 state 覆盖输入框，导致"填进去了又被清空"。
+        // 所以填入后要回检，被清空就自动换方式重填，而不是直接报失败。
         if (!filled) {
             setTimeout(() => {
                 if (inputValue().length < Math.min(10, text.length)) {
-                    console.warn('[网页AI] 输入框仍为空');
+                    console.warn('[网页AI] 首次填入未生效，重试');
                     fillProviderInput(input, text);
                 }
             }, 200);
+        } else {
+            let verifyTries = 0;
+            const verifyTimer = setInterval(() => {
+                if (inputValue().length >= Math.min(10, text.length)) { clearInterval(verifyTimer); return; }
+                verifyTries++;
+                if (verifyTries > 3) { clearInterval(verifyTimer); return; }
+                console.warn('[网页AI] 输入框内容被前端清空，第', verifyTries, '次重填');
+                insertTextNative(input, text);
+                if (inputValue().length < Math.min(10, text.length)) fillProviderInput(input, text);
+            }, 300);
         }
 
         if (!autoSend) {
@@ -1363,17 +1388,8 @@
     function runProviderPage(provider) {
         const pending = readTask(provider);
         if (!pending) {
-            // 只在"刚打开"时提示一次：如果用户是手动打开 AI 页面，就不打扰
-            if (!hasConsumedInThisPage(provider) && !window.__pageAiSummaryNoTaskHinted) {
-                window.__pageAiSummaryNoTaskHinted = true;
-                log('当前标签页没有待发送任务');
-                setTimeout(() => {
-                    // 3.5 秒后还没收到任务才提示，给"任务刚写入"的情况留出窗口
-                    if (hasConsumedInThisPage(provider)) return;
-                    if (document.hasFocus && !document.hasFocus()) return;
-                    notify('网页 AI 总结', '这个标签页没有收到待发送内容。请在原文页面点右侧的「AI 总结」按钮，脚本会在你刚点选的那个模型里自动填入。');
-                }, 3500);
-            }
+            // 用户自己打开 AI 页面是常态，这里只记日志，不弹通知（否则每次都被打扰）
+            log('当前标签页没有待发送任务');
             return;
         }
 
