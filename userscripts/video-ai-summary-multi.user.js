@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.5.2
+// @version      1.6.0
 // @author       Ace & Macro
-// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：统一走 Google AI 模式按链接总结。
+// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可在 Google AI 模式按链接总结。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
-// @match        https://www.youtube.com/watch*
-// @match        https://youtube.com/watch*
+// @match        https://www.youtube.com/*
+// @match        https://youtube.com/*
 // @match        https://www.google.com/search*
 // @match        https://chat.deepseek.com/*
 // @match        https://chatgpt.com/*
@@ -50,14 +50,19 @@
     'use strict';
 
     const TASK_KEYS = {
-        bilibili: 'VIDEO_AI_SUMMARY_TASK_BILIBILI',
-        google: 'VIDEO_AI_SUMMARY_TASK_GOOGLE'   // YouTube 统一走 Google AI 模式
+        bilibili: 'VIDEO_AI_SUMMARY_TASK_BILIBILI'
     };
 
-    const GOOGLE_QUERY_KEY = 'VIDEO_AI_SUMMARY_GOOGLE_QUERY';
+    // Google AI 模式任务队列：{ [videoUrl]: { prompt, timestamp } }
+    // 按视频链接分键：列表页连点多个视频总结时不会互相覆盖
+    const GOOGLE_TASKS_KEY = 'VIDEO_AI_SUMMARY_GOOGLE_TASKS';
+    const GOOGLE_LEGACY_KEYS = [
+        'VIDEO_AI_SUMMARY_TASK_GOOGLE',   // 旧版单 key 任务
+        'VIDEO_AI_SUMMARY_GOOGLE_QUERY'   // 旧版短查询替换
+    ];
 
     const PROVIDER_KEY = 'VIDEO_AI_SUMMARY_PROVIDER';
-    const TASK_TTL = 2 * 60 * 1000; // 待发送内容有效期：2 分钟
+    const TASK_TTL = 5 * 60 * 1000; // 待发送内容有效期：5 分钟
     const DEBUG = false;
 
     // 想新增模型时，只需要在 PROVIDERS 里加一项
@@ -400,6 +405,50 @@
             log('GM_openInTab 失败，回退 window.open', e);
         }
         window.open(url, '_blank');
+    }
+
+    // 完整提示词直接进 q：AI 模式一打开就按我们的提示词跑，页面脚本只做兜底修补
+    function buildGoogleAiModeUrl(prompt) {
+        const params = new URLSearchParams();
+        params.set('q', prompt);
+        params.set('udm', '50');
+        params.set('aep', '42');
+        params.set('hl', 'zh-CN');
+        return 'https://www.google.com/search?' + params.toString();
+    }
+
+    function queueGoogleTask(videoUrl, prompt) {
+        let tasks = {};
+        try { tasks = GM_getValue(GOOGLE_TASKS_KEY, {}); } catch (e) { tasks = {}; }
+        if (!tasks || typeof tasks !== 'object' || Array.isArray(tasks)) tasks = {};
+
+        const now = Date.now();
+        Object.keys(tasks).forEach(key => {
+            const task = tasks[key];
+            if (!task || !task.prompt || now - (Number(task.timestamp) || 0) > TASK_TTL) {
+                delete tasks[key];
+            }
+        });
+
+        tasks[videoUrl] = { prompt: prompt, timestamp: now };
+        try { GM_setValue(GOOGLE_TASKS_KEY, tasks); } catch (e) { /* ignore */ }
+    }
+
+    // YouTube 统一入口：播放页按钮和列表卡片按钮都走这里，videoUrl 由调用方显式传入
+    async function sendToGoogleAiMode(videoUrl) {
+        if (!videoUrl) throw new Error('没有拿到视频链接');
+
+        const prompt = LINK_SUMMARY_PROMPT.replace(/{{URL}}/g, videoUrl);
+        queueGoogleTask(videoUrl, prompt);
+
+        try {
+            if (typeof GM_setClipboard === 'function') GM_setClipboard(prompt, 'text');
+        } catch (e) { /* ignore */ }
+
+        const url = buildGoogleAiModeUrl(prompt);
+        await sleep(120);
+        openGoogleTab(url);
+        console.info('[视频AI] 已打开 Google AI 模式:', videoUrl);
     }
 
     // ================================================================
@@ -1224,6 +1273,34 @@
                 cursor: not-allowed;
                 transform: none;
             }
+
+            #yt-ai-card-summary-btn {
+                position: fixed;
+                display: none;
+                padding: 6px 13px;
+                background: rgba(0, 0, 0, 0.85);
+                color: #fff;
+                border: 1px solid rgba(255, 255, 255, 0.35);
+                border-radius: 20px;
+                font-size: 13px;
+                font-weight: 600;
+                font-family: Roboto, Arial, sans-serif;
+                line-height: 1.4;
+                cursor: pointer;
+                z-index: 2147483647;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+                transition: background 0.2s, transform 0.2s;
+                user-select: none;
+            }
+            #yt-ai-card-summary-btn:hover {
+                background: #c4302b;
+                transform: scale(1.05);
+            }
+            #yt-ai-card-summary-btn:disabled {
+                background: #2e7d32;
+                cursor: default;
+                transform: none;
+            }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
@@ -1359,67 +1436,34 @@
             ytButton.id = 'yt-ai-summary-btn';
             ytButton.type = 'button';
             ytButton.textContent = '✨ AI 总结';
-            ytButton.title = '在 Google AI 模式里总结这个视频（按链接）';
-            ytButton.addEventListener('click', onYouTubeClick);
+            ytButton.title = '在 Google AI 模式里总结当前视频（按链接）';
+            ytButton.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onYouTubeClick(location.href.split('#')[0]);
+            });
 
             // YouTube 统一走 Google AI 模式，所以不挂模型下拉框
             ytWrap.appendChild(ytButton);
         }
 
-        async function onYouTubeClick() {
+        async function onYouTubeClick(videoUrl) {
             if (ytRunning) return;
             ytRunning = true;
             setYouTubeButtonState('loading');
 
             try {
-                const videoUrl = location.href.split('#')[0];
-
-                const title = document.title || '';
-
-                // YouTube 统一走 Google AI 模式（AI Mode 能直接读视频链接），
-                // 不再抓取字幕、也不再跳所选聊天模型。
-                await sendToGoogleAiMode(videoUrl, title);
+                // 播放页按钮作用于当前正在播放的视频，列表卡片按钮传卡片自己的链接
+                await sendToGoogleAiMode(videoUrl || location.href.split('#')[0]);
 
                 setYouTubeButtonState('done');
                 setTimeout(() => setYouTubeButtonState('idle'), 2500);
             } catch (err) {
-                alert('打开失败：' + ((err && err.message) ? err.message : String(err)));
+                showInfoBar('打开失败：' + ((err && err.message) ? err.message : String(err)), 'error', 5000);
                 setYouTubeButtonState('idle');
             } finally {
                 ytRunning = false;
             }
-        }
-
-        // YouTube 统一入口：打开 Google AI 模式，由目标页把完整提示词填进去
-        async function sendToGoogleAiMode(videoUrl, title) {
-            const prompt = LINK_SUMMARY_PROMPT.replace('{{URL}}', videoUrl);
-            const task = {
-                content: prompt,
-                timestamp: Date.now(),
-                videoUrl: videoUrl,
-                source: 'youtube'
-            };
-
-            // 一句话的链接查询：这个 AI 模式地址自带 q 参数，从 YouTube 页面直接新开最稳
-            const shortQuery = `请详细总结这个 YouTube 视频的内容：${videoUrl}`;
-            const url = buildGoogleUrl(shortQuery, 'udm=50&aep=42');
-
-            GM_setValue(TASK_KEYS.google, task);
-            GM_setValue(GOOGLE_QUERY_KEY, {
-                query: shortQuery,
-                prompt: prompt,
-                timestamp: Date.now()
-            });
-
-            try {
-                if (typeof GM_setClipboard === 'function') GM_setClipboard(prompt, 'text');
-            } catch (e) { /* ignore */ }
-
-            await sleep(120);
-            // 原页面同时打开一个新标签页。
-            // 目标页会识别到 GOOGLE_QUERY_KEY，自动把一句话查询替换成完整提示词。
-            GM_openInTab(url, { active: true, insert: true });
-            console.info('[视频AI] 已打开 Google AI 模式:', url);
         }
 
         function setYouTubeButtonState(state) {
@@ -1437,6 +1481,9 @@
         }
 
         function mountYouTubeButton() {
+            // 播放器内按钮只属于 /watch 页；首页 / 搜索 / 频道等由悬浮卡片按钮负责
+            if (location.pathname !== '/watch') return;
+
             const player = document.getElementById('movie_player');
             if (!player) {
                 if (ytWrap && ytWrap.parentNode) ytWrap.remove();
@@ -1457,6 +1504,183 @@
         document.addEventListener('yt-navigate-finish', mountYouTubeButton);
         setInterval(mountYouTubeButton, 2000);
 
+        // 首页 / 相关视频列表 / 播放列表：hover 卡片即出现 AI 总结按钮
+        initYouTubeCardButtons();
+    }
+
+    // ================================================================
+    //  YouTube：首页 / 相关视频列表的悬浮按钮
+    //  参考 youtube-summary-collector/content.js：全局单例悬浮按钮 + 事件委托，
+    //  不往每张卡片注入 DOM，天然兼容 SPA 导航和无限滚动
+    // ================================================================
+    const YT_CARD_SELECTORS = [
+        'ytd-rich-grid-media',                  // 首页大卡片
+        'ytd-video-renderer',                   // 搜索 / 订阅列表
+        'ytd-compact-video-renderer',           // 播放页右侧「接下来播放」相关视频
+        'ytd-grid-video-renderer',              // 频道网格
+        'ytd-rich-item-renderer',               // 新版首页 ViewModel DOM
+        'yt-lockup-view-model',                 // 新版右侧推荐列表 DOM
+        'ytd-playlist-video-renderer',          // 播放列表页
+        'ytd-playlist-panel-video-renderer'     // 播放页队列面板
+    ].join(', ');
+
+    const YT_THUMB_SELECTORS = [
+        'ytd-thumbnail',
+        'a#thumbnail',
+        '.ytLockupViewModelContentImage',
+        'yt-image'
+    ].join(', ');
+
+    let ytCardButton = null;
+    let ytActiveCard = null;
+    let ytActiveVideoUrl = '';
+    let ytCardBusy = false;
+
+    // 只要干净的 watch 链接：去掉 list / t / index / si 等参数
+    function cleanYouTubeVideoUrl(raw) {
+        if (!raw) return '';
+        try {
+            const url = new URL(raw, location.origin);
+            if (!/(^|\.)youtube\.com$/.test(url.hostname)) return '';
+            // 本次不处理 Shorts / 频道 / 播放列表等非普通视频卡片
+            if (url.pathname !== '/watch') return '';
+            const v = url.searchParams.get('v');
+            if (!v) return '';
+            return 'https://www.youtube.com/watch?v=' + encodeURIComponent(v);
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function extractVideoUrlFromCard(card) {
+        const anchors = [];
+        const push = (node) => {
+            if (node && anchors.indexOf(node) === -1) anchors.push(node);
+        };
+
+        try {
+            push(card.querySelector('a#thumbnail'));
+            push(card.querySelector('a[href*="/watch?"]'));
+            push(card.querySelector('a.ytLockupViewModelContentImage'));
+            card.querySelectorAll('a[href]').forEach(push);
+        } catch (e) { /* ignore */ }
+
+        for (const anchor of anchors) {
+            const clean = cleanYouTubeVideoUrl(anchor.getAttribute('href') || anchor.href || '');
+            if (clean) return clean;
+        }
+        return '';
+    }
+
+    function initYouTubeCardButtons() {
+        // 脚本热更新 / 多实例残留的僵尸按钮，只保留一个
+        document.querySelectorAll('[data-video-ai-card-btn]').forEach(node => {
+            if (node !== ytCardButton) node.remove();
+        });
+
+        ytCardButton = document.createElement('button');
+        ytCardButton.id = 'yt-ai-card-summary-btn';
+        ytCardButton.type = 'button';
+        ytCardButton.dataset.videoAiCardBtn = '1';
+        ytCardButton.textContent = '✨ AI 总结';
+        ytCardButton.title = '在 Google AI 模式里总结这个视频（按链接）';
+        (document.body || document.documentElement).appendChild(ytCardButton);
+
+        ytCardButton.addEventListener('click', onYouTubeCardButtonClick);
+        document.addEventListener('mouseover', onYouTubeCardMouseOver);
+        document.addEventListener('scroll', () => hideYouTubeCardButton(true), { capture: true, passive: true });
+        document.addEventListener('yt-navigate-finish', () => hideYouTubeCardButton(true));
+    }
+
+    function onYouTubeCardMouseOver(event) {
+        if (!ytCardButton) return;
+        const target = event.target;
+        if (!target || target === ytCardButton || ytCardButton.contains(target)) return;
+
+        // 鼠标移进脱离文档流的悬浮预览播放器时，保持按钮显示
+        if (target.closest && !target.closest(YT_CARD_SELECTORS) &&
+            target.closest('ytd-video-preview, ytd-inline-preview, #inline-preview-player')) {
+            return;
+        }
+
+        const card = target.closest ? target.closest(YT_CARD_SELECTORS) : null;
+        if (!card) {
+            hideYouTubeCardButton(true);
+            return;
+        }
+
+        if (card !== ytActiveCard) {
+            ytActiveCard = card;
+            ytActiveVideoUrl = extractVideoUrlFromCard(card);
+        }
+
+        // 频道 / Shorts / 播放列表等拿不到普通视频链接，不显示按钮
+        if (!ytActiveVideoUrl || !document.contains(card)) {
+            hideYouTubeCardButton(false);
+            return;
+        }
+
+        let rect = null;
+        const anchor = card.querySelector(YT_THUMB_SELECTORS);
+        if (anchor && anchor.getBoundingClientRect) rect = anchor.getBoundingClientRect();
+        // YouTube hover 预览会隐藏原缩略图（宽高归零），降级用整张卡片定位
+        if (!rect || !rect.width || !rect.height) rect = card.getBoundingClientRect();
+        if (!rect || !rect.width || !rect.height) {
+            hideYouTubeCardButton(false);
+            return;
+        }
+
+        // 同时装了 youtube-summary-collector 扩展时，它的按钮也在左上角 +8px；
+        // 检测到就下移一行，避免两个悬浮按钮叠在一起
+        let topOffset = 8;
+        try {
+            if (document.querySelector('.summary-collector-btn')) topOffset = 42;
+        } catch (e) { /* ignore */ }
+
+        ytCardButton.style.left = (rect.left + 8) + 'px';
+        ytCardButton.style.top = (rect.top + topOffset) + 'px';
+        ytCardButton.style.display = 'block';
+    }
+
+    function hideYouTubeCardButton(clearActive) {
+        if (ytCardButton) ytCardButton.style.display = 'none';
+        if (clearActive) {
+            ytActiveCard = null;
+            ytActiveVideoUrl = '';
+        }
+    }
+
+    async function onYouTubeCardButtonClick(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (ytCardBusy || !ytActiveVideoUrl) return;
+
+        // SPA 换页后旧卡片可能已被移除，避免总结到上一个视频
+        if (!ytActiveCard || !document.contains(ytActiveCard)) {
+            showInfoBar('视频卡片已失效，请把鼠标移到视频上再试', 'error', 3000);
+            return;
+        }
+
+        ytCardBusy = true;
+        ytCardButton.disabled = true;
+        ytCardButton.textContent = '⏳ 打开 AI 模式...';
+
+        try {
+            await sendToGoogleAiMode(ytActiveVideoUrl);
+            ytCardButton.textContent = '✅ 已打开新标签页';
+            setTimeout(resetYouTubeCardButton, 2500);
+        } catch (err) {
+            showInfoBar('打开失败：' + ((err && err.message) ? err.message : String(err)), 'error', 5000);
+            resetYouTubeCardButton();
+        } finally {
+            ytCardBusy = false;
+        }
+    }
+
+    function resetYouTubeCardButton() {
+        if (!ytCardButton) return;
+        ytCardButton.disabled = false;
+        ytCardButton.textContent = '✨ AI 总结';
     }
 
     // ================================================================
@@ -1572,61 +1796,86 @@
         });
     }
 
-    function readGoogleTask() {
-        let raw = null;
-        try { raw = GM_getValue(TASK_KEYS.google, null); } catch (e) { return null; }
-        if (!raw || !raw.content) return null;
+    // 按 q 参数里携带的视频链接认领任务：连开多个标签页也不会串
+    function findMyGoogleTask() {
+        let q = '';
+        try { q = new URLSearchParams(location.search).get('q') || ''; } catch (e) { return null; }
+        if (!q) return null;
 
-        const timestamp = Number(raw.timestamp) || 0;
-        if (!timestamp || Date.now() - timestamp > TASK_TTL) {
-            try { GM_deleteValue(TASK_KEYS.google); } catch (e) { /* ignore */ }
-            return null;
+        let tasks = null;
+        try { tasks = GM_getValue(GOOGLE_TASKS_KEY, {}); } catch (e) { return null; }
+        if (!tasks || typeof tasks !== 'object' || Array.isArray(tasks)) return null;
+
+        const now = Date.now();
+        let hit = null;
+        let dirty = false;
+
+        Object.keys(tasks).forEach(videoUrl => {
+            const task = tasks[videoUrl];
+            if (!task || !task.prompt || now - (Number(task.timestamp) || 0) > TASK_TTL) {
+                delete tasks[videoUrl];
+                dirty = true;
+                return;
+            }
+            if (!hit && videoUrl && q.includes(videoUrl)) hit = { videoUrl: videoUrl, prompt: task.prompt };
+        });
+
+        // 一次性消费：页面已经拿到（或即将修补）这份提示词
+        if (hit) {
+            delete tasks[hit.videoUrl];
+            dirty = true;
         }
-        return raw;
+        if (dirty) {
+            try { GM_setValue(GOOGLE_TASKS_KEY, tasks); } catch (e) { /* ignore */ }
+        }
+        return hit;
     }
 
-    function readGoogleShortQuery() {
-        let raw = null;
-        try { raw = GM_getValue(GOOGLE_QUERY_KEY, null); } catch (e) { return null; }
-        try { GM_deleteValue(GOOGLE_QUERY_KEY); } catch (e) { /* ignore */ }
+    function normalizeQueryText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+    }
 
-        if (!raw || !raw.query) return null;
-        const timestamp = Number(raw.timestamp) || 0;
-        if (!timestamp || Date.now() - timestamp > TASK_TTL) return null;
-        return raw;
+    // 只比开头不够：超长 q 被 Google 截断时开头仍在、尾部会丢
+    function promptAlreadyDelivered(prompt) {
+        let rawQuery = '';
+        try { rawQuery = new URLSearchParams(location.search).get('q') || ''; } catch (e) { return true; }
+        const q = normalizeQueryText(rawQuery);
+        const full = normalizeQueryText(prompt);
+        if (!full) return true;
+        return q.includes(full.slice(0, 60)) && q.includes(full.slice(-40));
     }
 
     function runGoogleAiMode() {
         if (googleAiModeRunning) return;
 
-        const shortQuery = readGoogleShortQuery();
-        const task = readGoogleTask();
+        // 清理旧版本（短查询 + 单 key）遗留在油猴存储里的值
+        GOOGLE_LEGACY_KEYS.forEach(key => {
+            try { GM_deleteValue(key); } catch (e) { /* ignore */ }
+        });
 
-        if (!shortQuery && !task) return;
+        const found = findMyGoogleTask();
+        if (!found) return;
 
         googleAiModeRunning = true;
-        const currentQuery = new URLSearchParams(location.search).get('q') || '';
-        const hasTaskQuery = /(?:^|&)q=/.test(location.search);
-        const fullPrompt = (shortQuery && shortQuery.prompt) || (task && task.content) || '';
+        console.info('[视频AI] Google AI 模式启动:', found.videoUrl);
 
-        console.info('[视频AI] Google AI 模式启动:', currentQuery ? '已带查询（将替换）' : '空查询');
+        // 正常情况：完整提示词已随 q 送达，什么都不做，避免重复提交出双份回答
+        if (promptAlreadyDelivered(found.prompt)) {
+            console.info('[视频AI] 提示词已随 q 送达，无需修补');
+            return;
+        }
 
+        // 兜底：q 被重定向弄丢或被截断时，重新填入完整提示词并提交
+        console.warn('[视频AI] q 里没有完整提示词，开始修补');
         waitForGoogleInput(20000).then(input => {
             if (!input) {
                 console.warn('[视频AI] 未找到 Google 搜索框，提示词已复制到剪贴板');
                 return;
             }
-
-            // 等页面稳定一点再操作，避免和 Google 自己的自动聚焦打架
             setTimeout(() => {
-                fillGoogleInput(input, fullPrompt);
-                console.info('[视频AI] 已填入完整提示词，准备提交');
-
-                setTimeout(() => {
-                    try { GM_deleteValue(TASK_KEYS.google); } catch (e) { /* ignore */ }
-                    submitGoogleQuery(input, fullPrompt);
-                }, 600);
-            }, hasTaskQuery ? 2200 : 1200);
+                fillGoogleInput(input, found.prompt);
+                setTimeout(() => submitGoogleQuery(input, found.prompt), 600);
+            }, 1200);
         });
     }
 
