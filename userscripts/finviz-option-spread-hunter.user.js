@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Finviz Option Spread Hunter
 // @namespace    http://tampermonkey.net/
-// @version      3.11
-// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, per-trade ROC ranking, and stacked floating UI.
+// @version      3.12
+// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, neutral per-trade data (ROC + price cushion), and stacked floating UI.
 // @match        *://finviz.com/stock.ashx*
 // @match        *://finviz.com/stock*
 // @match        *://*.finviz.com/stock*
@@ -26,7 +26,7 @@
 
         const container = document.createElement('div');
         container.id = 'spread-hunter-container';
-        // 将 bottom 从 140px 提高到 185px，与下方的比例价差猎手、预期波动计算器并排向上依次排列，彻底解决重叠问题
+        // Stack this panel above the ratio spread scanner and expected-move calculator to avoid overlap.
         container.style.cssText = `
             position: fixed; bottom: 185px; right: 30px; z-index: 9999;
             font-family: Arial, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
@@ -122,8 +122,19 @@
         document.getElementById('sh-scan-btn').addEventListener('click', scanAndHighlight);
     }
 
-    // 从 Finviz 的 Expiry 选择器读取当前到期日，用于 DTE 窗口提示
-    // 返回 { days, raw }；选择器缺失或日期非法时返回 null（不抛错，扫描仍可继续）
+    // Read the underlying's "Last Close" from the page text. This is the same
+    // source used by the IV skew and expected-move scripts in this repo.
+    // Returns null when the quote is missing so callers can degrade gracefully.
+    function getLastClosePrice() {
+        const match = document.body.innerText.match(/Last Close\s*([\d,]+\.\d+)/);
+        if (!match) return null;
+        const price = parseFloat(match[1].replace(/,/g, ''));
+        return isFinite(price) && price > 0 ? price : null;
+    }
+
+    // Read the selected expiry from Finviz's Expiry selector for the DTE hint.
+    // Returns { days, raw }, or null when the selector is missing or the date
+    // is invalid. Callers must keep working in that case.
     function getDaysToExpiry() {
         const button = document.querySelector('button[aria-label="Expiry select"]');
         const span = button && button.querySelector('span');
@@ -140,7 +151,7 @@
         const today = new Date();
         today.setHours(0, 0, 0, 0);
 
-        // 用 round 而非 ceil：夏令时切换会让整天数出现 ±1 小时的毫秒偏差
+        // Use round instead of ceil: DST shifts can make a whole-day diff off by one hour.
         const days = Math.round((expiryDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
         if (!isFinite(days) || days <= 0) return null;
 
@@ -194,6 +205,7 @@
         try {
             const targetWidth = parseFloat(document.getElementById('sh-width').value) || 10;
             const maxDelta = parseFloat(document.getElementById('sh-max-delta').value) || 0.33;
+            const spotPrice = getLastClosePrice();
 
             const rows = document.querySelectorAll('tr');
             let strikeIdx = -1, putLastIdx = -1, putDeltaIdx = -1;
@@ -268,20 +280,26 @@
                             const absDelta = Math.abs(shortLeg.delta);
 
                             if (ratio >= 0.25 && ratio <= 0.40 && absDelta <= maxDelta) {
-                                // Put Credit Spread: 最大亏损 = 价差宽度 - 净权利金；
-                                // ROC = 最大盈利 / 最大亏损，只表示「这一笔交易」本身。
-                                // 不做任何时间外推：把 42 天换算成一年重复 8.69 次，
-                                // 隐含「每期都能满仓复投、每期都赚满、且从不亏损」的假设，不成立。
+                                // Put Credit Spread: max loss = width - net credit;
+                                // ROC = max profit / max loss, for THIS trade only.
+                                // No time extrapolation: annualizing would assume
+                                // repeated full-size trades that always hit max profit.
                                 const maxRisk = width - netCredit;
                                 const roc = maxRisk > 0 ? (netCredit / maxRisk) * 100 : 0;
+
+                                // Price distance from the short strike to the last close.
+                                // Negative means the short leg is already in the money.
+                                const cushion = spotPrice
+                                    ? ((spotPrice - shortLeg.strike) / spotPrice) * 100
+                                    : null;
 
                                 matches.push({
                                     shortStrike: shortLeg.strike,
                                     longStrike: longLeg.strike,
                                     netCredit,
-                                    ratio,
                                     maxRisk,
                                     roc,
+                                    cushion,
                                     delta: shortLeg.delta,
                                     shortTd: shortLeg.strikeTd,
                                     longTd: longLeg.strikeTd
@@ -292,17 +310,21 @@
                 }
             }
 
-            // 按这一笔交易的 ROC 从高到低排列，最优组合落在结果框默认可见的顶部
-            matches.sort((a, b) => b.roc - a.roc);
+            // Keep the neutral strike order from the options chain. No ranking is
+            // implied: the user weighs credit, risk, delta and cushion themselves.
 
             let htmlContent = '';
-            matches.forEach((m, idx) => {
+            matches.forEach((m) => {
+                const cushionText = m.cushion !== null
+                    ? `~${m.cushion.toFixed(1)}%`
+                    : 'N/A';
+
                 htmlContent += `
                     <div style="margin-bottom: 6px; border-bottom: 1px solid #374151; padding-bottom: 4px;">
-                        <div style="color: #f59e0b; font-weight: bold;">${idx === 0 ? '🏆 ' : ''}Put ${m.shortStrike} / ${m.longStrike}</div>
-                        <div>Credit: <span style="color: #34d399;">$${m.netCredit.toFixed(2)}</span> (Credit/Width ${(m.ratio * 100).toFixed(1)}%)</div>
-                        <div>Max Risk: $${m.maxRisk.toFixed(2)} · <span style="color: #34d399; font-weight: bold;">ROC: ${m.roc.toFixed(1)}%</span></div>
-                        <div style="color: #9ca3af;">Short Delta: ${m.delta}</div>
+                        <div style="color: #f59e0b; font-weight: bold;">Put ${m.shortStrike} / ${m.longStrike}</div>
+                        <div>Credit: $${m.netCredit.toFixed(2)}</div>
+                        <div>Max Risk: $${m.maxRisk.toFixed(2)} · ROC: ${m.roc.toFixed(1)}%</div>
+                        <div>Short Delta: ${m.delta} · <span title="(Last Close - Short Strike) / Last Close">Cushion: ${cushionText}</span></div>
                     </div>
                 `;
 
@@ -313,13 +335,14 @@
             });
 
             const foundCount = matches.length;
+            const countLabel = foundCount === 1 ? 'candidate' : 'candidates';
 
             if (foundCount === 0) {
                 resultBox.innerHTML = `<span style="color: #f87171;">No $${targetWidth} spreads found with Delta <= ${maxDelta} and Ratio between 25%-40%.</span>`;
             } else {
                 resultBox.innerHTML = `
-                    <div style="color: #34d399; font-weight: bold; margin-bottom: 2px;">🎯 Found ${foundCount} Spreads (Highlighted):</div>
-                    <div style="color: #9ca3af; font-size: 10px; margin-bottom: 6px;">Per-trade ROC = Credit / (Width - Credit) · sorted high to low</div>
+                    <div style="color: #34d399; font-weight: bold; margin-bottom: 2px;">🎯 ${foundCount} ${countLabel} · data only</div>
+                    <div style="color: #9ca3af; font-size: 10px; margin-bottom: 6px;">Per-trade ROC = Credit / (Width - Credit)</div>
                 ` + htmlContent;
             }
 
