@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.6.0
+// @version      1.6.1
 // @author       Ace & Macro
 // @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可在 Google AI 模式按链接总结。
 // @match        *://*.bilibili.com/video/*
@@ -1620,26 +1620,44 @@
             return;
         }
 
-        let rect = null;
         const anchor = card.querySelector(YT_THUMB_SELECTORS);
-        if (anchor && anchor.getBoundingClientRect) rect = anchor.getBoundingClientRect();
-        // YouTube hover 预览会隐藏原缩略图（宽高归零），降级用整张卡片定位
-        if (!rect || !rect.width || !rect.height) rect = card.getBoundingClientRect();
-        if (!rect || !rect.width || !rect.height) {
-            hideYouTubeCardButton(false);
-            return;
+        const thumbRect = anchor && anchor.getBoundingClientRect
+            ? anchor.getBoundingClientRect()
+            : null;
+
+        let rightEdge;
+        let topEdge;
+        if (thumbRect && thumbRect.width && thumbRect.height) {
+            rightEdge = thumbRect.right;
+            topEdge = thumbRect.top;
+        } else {
+            // YouTube hover 预览会隐藏原缩略图（宽高归零），降级用整张卡片定位
+            const cardRect = card.getBoundingClientRect();
+            if (!cardRect || !cardRect.width || !cardRect.height) {
+                hideYouTubeCardButton(false);
+                return;
+            }
+            // 横向列表卡片右边是标题区，用常见缩略图宽度把右边缘拉回缩略图一侧
+            const isSideBySide = card.matches(
+                'ytd-compact-video-renderer, ytd-playlist-panel-video-renderer, ytd-playlist-video-renderer'
+            );
+            rightEdge = isSideBySide
+                ? Math.min(cardRect.right, cardRect.left + 168)
+                : cardRect.right;
+            topEdge = cardRect.top;
         }
 
-        // 同时装了 youtube-summary-collector 扩展时，它的按钮也在左上角 +8px；
-        // 检测到就下移一行，避免两个悬浮按钮叠在一起
-        let topOffset = 8;
-        try {
-            if (document.querySelector('.summary-collector-btn')) topOffset = 42;
-        } catch (e) { /* ignore */ }
-
-        ytCardButton.style.left = (rect.left + 8) + 'px';
-        ytCardButton.style.top = (rect.top + topOffset) + 'px';
+        // 先让按钮可见才能量到真实宽度；同帧内隐藏再恢复，不会闪烁
+        ytCardButton.style.visibility = 'hidden';
         ytCardButton.style.display = 'block';
+        const btnWidth = ytCardButton.offsetWidth || 96;
+
+        // 右上角。右边缘留 44px 给 YouTube 自带的「稍后观看 / 加入队列」按钮，
+        // 想更贴边把这个数字改小即可（8 = 几乎贴着右上角）
+        const rightInset = 44;
+        ytCardButton.style.left = (rightEdge - btnWidth - rightInset) + 'px';
+        ytCardButton.style.top = (topEdge + 8) + 'px';
+        ytCardButton.style.visibility = '';
     }
 
     function hideYouTubeCardButton(clearActive) {
