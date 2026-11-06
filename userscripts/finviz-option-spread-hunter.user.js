@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Finviz Option Spread Hunter
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, ROC-based return ranking, and stacked floating UI.
+// @version      3.10
+// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, ROC and annualized return ranking, and stacked floating UI.
 // @match        *://finviz.com/stock.ashx*
 // @match        *://finviz.com/stock*
 // @match        *://*.finviz.com/stock*
@@ -122,6 +122,31 @@
         document.getElementById('sh-scan-btn').addEventListener('click', scanAndHighlight);
     }
 
+    // 从 Finviz 的 Expiry 选择器读取当前到期日，供 DTE 提示与年化收益率共用
+    // 返回 { days, raw }；选择器缺失或日期非法时返回 null（不抛错，扫描仍可继续）
+    function getDaysToExpiry() {
+        const button = document.querySelector('button[aria-label="Expiry select"]');
+        const span = button && button.querySelector('span');
+        const raw = span ? span.innerText.trim() : '';
+        if (!raw) return null;
+
+        const [month, day, year] = raw.split('/');
+        if (!month || !day || !year) return null;
+
+        const expiryDate = new Date(parseInt(year, 10), parseInt(month, 10) - 1, parseInt(day, 10));
+        if (isNaN(expiryDate.getTime())) return null;
+        expiryDate.setHours(0, 0, 0, 0);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        // 用 round 而非 ceil：夏令时切换会让整天数出现 ±1 小时的毫秒偏差
+        const days = Math.round((expiryDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+        if (!isFinite(days) || days <= 0) return null;
+
+        return { days, raw };
+    }
+
     function updateDTEInfo() {
         const dteBox = document.getElementById('sh-dte-info');
         try {
@@ -132,30 +157,20 @@
             const maxTargetDate = new Date(today.getTime() + 50 * 24 * 60 * 60 * 1000);
             const idealDate = new Date(today.getTime() + 45 * 24 * 60 * 60 * 1000);
 
-            const expiryButton = document.querySelector('button[aria-label="Expiry select"]');
-            let rawExpiry = "";
-            if (expiryButton && expiryButton.querySelector('span')) {
-                rawExpiry = expiryButton.querySelector('span').innerText.trim();
-            }
+            const expiryInfo = getDaysToExpiry();
 
             let dteStatus = "";
-            if (rawExpiry) {
-                const [month, day, year] = rawExpiry.split('/');
-                if (month && day && year) {
-                    const expiryDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
-                    expiryDate.setHours(0,0,0,0);
-                    const daysToExpiry = Math.ceil((expiryDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-
-                    if (daysToExpiry >= 30 && daysToExpiry <= 50) {
-                        dteStatus = `<span style="color: #34d399; font-weight:bold;">✅ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - Optimal)</span>`;
-                    } else if (daysToExpiry < 30) {
-                        dteStatus = `<span style="color: #f87171; font-weight:bold;">⚠️ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - High Gamma Risk)</span>`;
-                    } else {
-                        dteStatus = `<span style="color: #60a5fa; font-weight:bold;">ℹ️ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - Slower Decay)</span>`;
-                    }
+            if (expiryInfo) {
+                const { days: daysToExpiry, raw: rawExpiry } = expiryInfo;
+                if (daysToExpiry >= 30 && daysToExpiry <= 50) {
+                    dteStatus = `<span style="color: #34d399; font-weight:bold;">✅ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - Optimal)</span>`;
+                } else if (daysToExpiry < 30) {
+                    dteStatus = `<span style="color: #f87171; font-weight:bold;">⚠️ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - High Gamma Risk)</span>`;
+                } else {
+                    dteStatus = `<span style="color: #60a5fa; font-weight:bold;">ℹ️ Selected: ${rawExpiry} (${daysToExpiry} Days DTE - Slower Decay)</span>`;
                 }
             } else {
-                dteStatus = `<span style="color: #9ca3af;">Could not locate Expiry selector.</span>`;
+                dteStatus = `<span style="color: #9ca3af;">Could not read selected Expiry date (annualized return will be N/A).</span>`;
             }
 
             dteBox.innerHTML = `
@@ -179,6 +194,10 @@
         try {
             const targetWidth = parseFloat(document.getElementById('sh-width').value) || 10;
             const maxDelta = parseFloat(document.getElementById('sh-max-delta').value) || 0.33;
+
+            // 当前选中的到期日；单次扫描内所有组合共享同一个 DTE
+            const expiryInfo = getDaysToExpiry();
+            const dte = expiryInfo ? expiryInfo.days : null;
 
             const rows = document.querySelectorAll('tr');
             let strikeIdx = -1, putLastIdx = -1, putDeltaIdx = -1;
@@ -258,6 +277,11 @@
                                 const maxRisk = width - netCredit;
                                 const roc = maxRisk > 0 ? (netCredit / maxRisk) * 100 : 0;
 
+                                // 简单年化（线性外推，365 自然日）：单期 ROC / DTE * 365。
+                                // 不采用 (1+ROC)^(365/DTE)-1 复利：它假设每期都能重复同等收益，
+                                // 在 30-50 天、ROC 40%+ 时会放大到数千%，失去比较意义。
+                                const annualRoc = dte ? roc * 365 / dte : null;
+
                                 matches.push({
                                     shortStrike: shortLeg.strike,
                                     longStrike: longLeg.strike,
@@ -265,6 +289,8 @@
                                     ratio,
                                     maxRisk,
                                     roc,
+                                    dte,
+                                    annualRoc,
                                     delta: shortLeg.delta,
                                     shortTd: shortLeg.strikeTd,
                                     longTd: longLeg.strikeTd
@@ -275,16 +301,23 @@
                 }
             }
 
-            // 按 ROC 从高到低排列，收益最高的组合落在结果框默认可见的顶部
-            matches.sort((a, b) => b.roc - a.roc);
+            // 按年化收益率排序；单次扫描内 DTE 相同，与按 ROC 排序等价，
+            // 但语义统一为「时间调整后的收益」，切换到期日后口径仍一致
+            const rank = (m) => (m.annualRoc !== null ? m.annualRoc : m.roc);
+            matches.sort((a, b) => rank(b) - rank(a));
 
             let htmlContent = '';
             matches.forEach((m, idx) => {
+                const annualText = m.annualRoc !== null
+                    ? `<span style="color: #60a5fa; font-weight: bold;">${m.annualRoc.toFixed(1)}%</span> <span style="color: #9ca3af; font-weight: normal;">(${m.dte}d DTE)</span>`
+                    : `<span style="color: #f87171;">N/A (no expiry date)</span>`;
+
                 htmlContent += `
                     <div style="margin-bottom: 6px; border-bottom: 1px solid #374151; padding-bottom: 4px;">
                         <div style="color: #f59e0b; font-weight: bold;">${idx === 0 ? '🏆 ' : ''}Put ${m.shortStrike} / ${m.longStrike}</div>
                         <div>Credit: <span style="color: #34d399;">$${m.netCredit.toFixed(2)}</span> (Credit/Width ${(m.ratio * 100).toFixed(1)}%)</div>
                         <div>Max Risk: $${m.maxRisk.toFixed(2)} · <span style="color: #34d399; font-weight: bold;">ROC: ${m.roc.toFixed(1)}%</span></div>
+                        <div>Annualized: ${annualText}</div>
                         <div style="color: #9ca3af;">Short Delta: ${m.delta}</div>
                     </div>
                 `;
@@ -300,9 +333,12 @@
             if (foundCount === 0) {
                 resultBox.innerHTML = `<span style="color: #f87171;">No $${targetWidth} spreads found with Delta <= ${maxDelta} and Ratio between 25%-40%.</span>`;
             } else {
+                const annualNote = dte
+                    ? `Annualized ROC = ROC * 365 / ${dte}d (simple, non-compounded) · sorted high to low`
+                    : `Annualized ROC unavailable (expiry date not found) · sorted by ROC`;
                 resultBox.innerHTML = `
                     <div style="color: #34d399; font-weight: bold; margin-bottom: 2px;">🎯 Found ${foundCount} Spreads (Highlighted):</div>
-                    <div style="color: #9ca3af; font-size: 10px; margin-bottom: 6px;">ROC = Credit / (Width - Credit) · sorted high to low</div>
+                    <div style="color: #9ca3af; font-size: 10px; margin-bottom: 6px; line-height: 1.4;">ROC = Credit / (Width - Credit)<br/>${annualNote}</div>
                 ` + htmlContent;
             }
 
