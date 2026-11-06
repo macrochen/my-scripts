@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Finviz Option Spread Hunter
 // @namespace    http://tampermonkey.net/
-// @version      3.8
-// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, and stacked floating UI.
+// @version      3.9
+// @description  Automated 1/3 Rule Put Credit Spread scanner for Finviz with DTE checks, Delta risk filters, ROC-based return ranking, and stacked floating UI.
 // @match        *://finviz.com/stock.ashx*
 // @match        *://finviz.com/stock*
 // @match        *://*.finviz.com/stock*
@@ -235,8 +235,7 @@
                 }
             });
 
-            let foundCount = 0;
-            let htmlContent = '';
+            const matches = [];
 
             for (let i = 0; i < putsData.length; i++) {
                 for (let j = 0; j < putsData.length; j++) {
@@ -254,29 +253,57 @@
                             const absDelta = Math.abs(shortLeg.delta);
 
                             if (ratio >= 0.25 && ratio <= 0.40 && absDelta <= maxDelta) {
-                                foundCount++;
-                                htmlContent += `
-                                    <div style="margin-bottom: 6px; border-bottom: 1px solid #374151; padding-bottom: 4px;">
-                                        <div style="color: #f59e0b; font-weight: bold;">Put ${shortLeg.strike} / ${longLeg.strike}</div>
-                                        <div>Credit: <span style="color: #34d399;">$${netCredit.toFixed(2)}</span> (${(ratio * 100).toFixed(1)}%)</div>
-                                        <div style="color: #9ca3af;">Short Delta: ${shortLeg.delta}</div>
-                                    </div>
-                                `;
+                                // Put Credit Spread: 最大亏损 = 价差宽度 - 净权利金；
+                                // ROC (Return on Capital) = 最大盈利 / 最大亏损，反映占用的保证金能赚多少
+                                const maxRisk = width - netCredit;
+                                const roc = maxRisk > 0 ? (netCredit / maxRisk) * 100 : 0;
 
-                                shortLeg.strikeTd.style.outline = '2px solid #10b981';
-                                shortLeg.strikeTd.style.outlineOffset = '-2px';
-                                longLeg.strikeTd.style.outline = '2px solid #ef4444';
-                                longLeg.strikeTd.style.outlineOffset = '-2px';
+                                matches.push({
+                                    shortStrike: shortLeg.strike,
+                                    longStrike: longLeg.strike,
+                                    netCredit,
+                                    ratio,
+                                    maxRisk,
+                                    roc,
+                                    delta: shortLeg.delta,
+                                    shortTd: shortLeg.strikeTd,
+                                    longTd: longLeg.strikeTd
+                                });
                             }
                         }
                     }
                 }
             }
 
+            // 按 ROC 从高到低排列，收益最高的组合落在结果框默认可见的顶部
+            matches.sort((a, b) => b.roc - a.roc);
+
+            let htmlContent = '';
+            matches.forEach((m, idx) => {
+                htmlContent += `
+                    <div style="margin-bottom: 6px; border-bottom: 1px solid #374151; padding-bottom: 4px;">
+                        <div style="color: #f59e0b; font-weight: bold;">${idx === 0 ? '🏆 ' : ''}Put ${m.shortStrike} / ${m.longStrike}</div>
+                        <div>Credit: <span style="color: #34d399;">$${m.netCredit.toFixed(2)}</span> (Credit/Width ${(m.ratio * 100).toFixed(1)}%)</div>
+                        <div>Max Risk: $${m.maxRisk.toFixed(2)} · <span style="color: #34d399; font-weight: bold;">ROC: ${m.roc.toFixed(1)}%</span></div>
+                        <div style="color: #9ca3af;">Short Delta: ${m.delta}</div>
+                    </div>
+                `;
+
+                m.shortTd.style.outline = '2px solid #10b981';
+                m.shortTd.style.outlineOffset = '-2px';
+                m.longTd.style.outline = '2px solid #ef4444';
+                m.longTd.style.outlineOffset = '-2px';
+            });
+
+            const foundCount = matches.length;
+
             if (foundCount === 0) {
                 resultBox.innerHTML = `<span style="color: #f87171;">No $${targetWidth} spreads found with Delta <= ${maxDelta} and Ratio between 25%-40%.</span>`;
             } else {
-                resultBox.innerHTML = `<div style="color: #34d399; font-weight: bold; margin-bottom: 6px;">🎯 Found ${foundCount} Spreads (Highlighted):</div>` + htmlContent;
+                resultBox.innerHTML = `
+                    <div style="color: #34d399; font-weight: bold; margin-bottom: 2px;">🎯 Found ${foundCount} Spreads (Highlighted):</div>
+                    <div style="color: #9ca3af; font-size: 10px; margin-bottom: 6px;">ROC = Credit / (Width - Credit) · sorted high to low</div>
+                ` + htmlContent;
             }
 
         } catch (err) {
