@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 回答发送到 ZenMark (DeepSeek & Kimi & Gemini & 元宝 & Google AI Mode)
 // @namespace    https://github.com/macrochen/ZenMark
-// @version      1.5.9
+// @version      1.5.10
 // @description  复用 DeepSeek、Kimi、Gemini、腾讯元宝、Google AI Mode 原生复制能力（AI Mode 无复制按钮时自动转 Markdown），一键发送至 ZenMark 阅读
 // @author       macrochen
 // @match        *://chat.deepseek.com/*
@@ -26,7 +26,7 @@
     'use strict';
 
     // 脚本版本（与头部 @version 保持一致，诊断时用于确认实际运行的是哪一版）
-    const ZENMARK_SCRIPT_VERSION = '1.5.9';
+    const ZENMARK_SCRIPT_VERSION = '1.5.10';
 
     // 线上部署服务地址
     const ZENMARK_API_URL = 'https://zenmark-bxx.pages.dev/api/read';
@@ -665,10 +665,14 @@
 
     // 行内放置：参与工具栏布局，但禁止被压缩或换行
     const INLINE_BTN_CSS = BTN_BASE_CSS +
-        'flex:0 0 auto;flex-shrink:0;align-self:center;margin-left:8px;vertical-align:middle;';
+        'flex:0 0 auto;flex-shrink:0;align-self:center;margin-left:8px;vertical-align:middle;pointer-events:auto;';
 
-    // 浮层放置：脱离布局
-    const OVERLAY_BTN_CSS = BTN_BASE_CSS + 'position:fixed;pointer-events:auto;';
+    // 浮层放置：脱离布局（z-index 保证不被页面元素盖住）
+    const OVERLAY_BTN_CSS = BTN_BASE_CSS + 'position:fixed;pointer-events:auto;z-index:2147483000;';
+
+    // 调试开关：改成 true 时强制走「同行浮层」，完全不改动 Google 的工具栏 DOM。
+    // 若某次 Google 改版后行内插入导致工具栏被撑开/错位，可临时打开它。
+    const AI_MODE_FORCE_OVERLAY = false;
 
     // 留空；确认结构后可追加精确选择器（例如 '[data-xid="aim-answer"]'）
     const AI_MODE_EXTRA_SELECTORS = [];
@@ -1274,24 +1278,22 @@
     }
 
     /**
-     * 把按钮以浮层形式挂在复制按钮旁边：
-     * - 用一个 fixed 定位的外层容器，位置跟随复制按钮实时计算
-     * - 不插入到 Google 的工具栏内部，因此不会影响原有布局（不换行、不缩放）
+     * 放置按钮：两条路径都保证与工具栏「同一行」
+     * 1) 行内插入：挂到复制/分享/赞/踩/⋮ 那一排的末尾，随原生布局对齐；
+     * 2) 同行浮层：fixed 定位到最右图标的右侧并垂直居中，不参与 Google 布局。
      */
     function placeButton(anchor, btn) {
-        // 位置优先：尽量放进工具栏同一排（复制/分享/赞/踩/⋮ 之后的那片空白）
-        if (tryInlinePlacement(anchor, btn)) {
+        if (!AI_MODE_FORCE_OVERLAY && tryInlinePlacement(anchor, btn)) {
             watchInlineStability(anchor, btn);
             return;
         }
-        // 确实放不下才回退浮层
         placeButtonOverlay(anchor, btn);
     }
 
     /**
      * 行内放置后的持续监测：
      * Google 会在悬停/重排时重新计算工具栏布局，插入瞬间正常不代表之后也正常。
-     * 一旦检测到换行或被压扁，立即改为浮层。
+     * 一旦检测到换行或被压扁，立即改为「同行浮层」。
      */
     function watchInlineStability(anchor, btn) {
         const check = () => {
@@ -1303,11 +1305,15 @@
 
             const b = btn.getBoundingClientRect();
             const a = anchor.getBoundingClientRect();
-            const squashed = b.width < 60 || b.height < 18;
-            const wrapped = a.height > 0 && Math.abs(b.top - a.top) > 4;
+            const squashed = b.width < 55 || b.height < 16;
+            // 注意：我们的按钮 22px、原生图标 ~40px，垂直居中时两者 top 天然差约 9px。
+            // 旧逻辑用 top 差 >4 判定换行，会在插入后立刻误判并踢回浮层；
+            // 这里改为比较「垂直中心」，只有真正掉到下一行（差 ≈ 一个行高）才切换。
+            const centerDiff = Math.abs((b.top + b.height / 2) - (a.top + a.height / 2));
+            const wrapped = a.height > 0 && centerDiff > Math.max(12, a.height * 0.7);
 
             if (squashed || wrapped) {
-                console.warn('[ZenMark TM] 行内按钮发生换行/压缩，切换为浮层', { squashed, wrapped });
+                console.warn('[ZenMark TM] 行内按钮发生换行/压缩，切换为同行浮层', { squashed, wrapped, centerDiff });
                 btn.remove();
                 cleanup();
                 placeButtonOverlay(anchor, btn);
@@ -1324,6 +1330,7 @@
         ['mouseenter', 'mouseover', 'pointerenter'].forEach(ev =>
             btn.addEventListener(ev, onMove, true));
         window.addEventListener('resize', onMove, true);
+        window.addEventListener('scroll', onMove, true);
 
         const cleanup = () => {
             clearTimeout(timer);
@@ -1331,12 +1338,12 @@
             btn.removeEventListener('mouseover', onMove, true);
             btn.removeEventListener('pointerenter', onMove, true);
             window.removeEventListener('resize', onMove, true);
+            window.removeEventListener('scroll', onMove, true);
         };
 
-        // 每 1.5s 复测一次，覆盖 Google 异步重排
-        let polls = 0;
+        // 每 1.5s 复测一次，覆盖 Google 异步重排；按钮被移除/转浮层后自动停止
         const poll = setInterval(() => {
-            if (!document.body.contains(btn) || btn.style.position === 'fixed' || ++polls > 20) {
+            if (!document.body.contains(btn) || btn.style.position === 'fixed') {
                 clearInterval(poll);
                 return;
             }
@@ -1345,44 +1352,79 @@
     }
 
     /**
+     * 找到与锚点（复制按钮）同一排的工具栏行，以及这一排里的图标按钮。
+     * 从锚点父级向外逐层找：该层至少含 2 个「和锚点垂直中心接近」的图标按钮。
+     * 用「同一水平带」而不是 spansMultipleAnswers 来排除其它回答的工具栏，
+     * 因为不同回答的工具栏本来就不在同一水平位置，且后者会把含多个复制按钮的
+     * 单行工具栏误判成「跨回答」。
+     */
+    function findToolbarRow(anchor) {
+        const a = anchor.getBoundingClientRect();
+        if (!a.height) return null;
+        const band = Math.max(14, a.height * 0.6);
+
+        let el = anchor.parentElement;
+        for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
+            if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+            const icons = collectIconButtons(el);
+            if (icons.length < 2) continue;
+            const sameLine = icons.filter(icon => {
+                const r = icon.getBoundingClientRect();
+                return Math.abs((r.top + r.height / 2) - (a.top + a.height / 2)) <= band;
+            });
+            if (sameLine.length >= 2) return { row: el, icons: sameLine };
+        }
+        return null;
+    }
+
+    /**
      * 尝试把按钮插入工具栏行内。
      * 真实 DOM 里工具栏常有「图标按钮 + 包装层」的结构，
-     * 所以往上找到“与复制按钮同一行的容器”再追加，而不是紧跟复制按钮。
+     * 所以先找到「同一排的图标组」，把按钮挂到最右一个图标之后，
+     * 而不是简单 append 到某个祖先容器的末尾。
      */
     function tryInlinePlacement(anchor, btn) {
-        const bar = anchor.parentElement;
-        if (!bar) return false;
+        const found = findToolbarRow(anchor);
+        if (!found) return false;
 
-        // 找“与复制按钮同一行、且包含多个图标按钮”的工具栏容器
-        let row = null;
-        let el = bar;
-        for (let depth = 0; el && depth < 4; depth++, el = el.parentElement) {
-            if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
-            const ico = collectIconButtons(el);
-            if (ico.length >= 2 && !spansMultipleAnswers(el)) {
-                row = el;
-                break;
-            }
-        }
-        if (!row) return false;
-
-        // 基线：以工具栏第一次出现的图标按钮顶部作为“同一排”的硬参照
-        const refIcons = collectIconButtons(row);
-        const refTop = refIcons.length ? refIcons[0].getBoundingClientRect().top : anchor.getBoundingClientRect().top;
+        const { row, icons } = found;
+        const rectOf = el => el.getBoundingClientRect();
+        const rightmost = icons.reduce(
+            (best, cur) => rectOf(cur).right > rectOf(best).right ? cur : best,
+            icons[0]
+        );
+        const refRect = rectOf(rightmost);
         const beforeRowH = row.getBoundingClientRect().height;
 
         btn.style.cssText = INLINE_BTN_CSS;
-        row.appendChild(btn);
 
-        // 校验（严格）：必须与参照图标同排、未被压扁、行高未增长
-        const btnRect = btn.getBoundingClientRect();
-        const sameRow = Math.abs(btnRect.top - refTop) <= 2;
-        const notSquashed = btnRect.width >= 60 && btnRect.height >= 18 && btnRect.width >= btn.scrollWidth - 2;
+        // 插到「同一排最后一个图标」的顶层挂载点之后，视觉上紧跟 ⋮ 更多按钮
+        let mountAfter = null;
+        Array.from(row.children).forEach(child => {
+            if (child === rightmost || child.contains(rightmost)) mountAfter = child;
+        });
+        if (mountAfter) mountAfter.after(btn);
+        else row.appendChild(btn);
+
+        const b = rectOf(btn);
+        // 「同一行」按垂直中心判定：按钮 22px 与图标 ~40px 都是居中对齐，
+        // top 本来就不相等。旧逻辑要求 |btn.top - icon.top| <= 2，
+        // 导致行内放置几乎必然被误判为换行，直接掉到下方浮层。
+        const centerDiff = Math.abs((b.top + b.height / 2) - (refRect.top + refRect.height / 2));
+        const sameRow = centerDiff <= Math.max(8, refRect.height / 2);
+        const notSquashed = b.width >= 60 && b.height >= 18 && b.width >= btn.scrollWidth - 2;
         const rowGrew = row.getBoundingClientRect().height > beforeRowH + 2;
+        const afterIcons = b.left >= refRect.right - 2; // 没有被挤回行首（换行）
 
-        if (sameRow && notSquashed && !rowGrew) return true;
+        if (sameRow && notSquashed && !rowGrew && afterIcons) {
+            btn.dataset.zmPlace = 'inline';
+            return true;
+        }
 
-        console.warn('[ZenMark TM] 工具栏容不下按钮，改用浮层', { sameRow, notSquashed, rowGrew, btnW: btnRect.width, top: btnRect.top, refTop });
+        console.warn('[ZenMark TM] 工具栏容不下按钮，改用同行浮层', {
+            sameRow, notSquashed, rowGrew, afterIcons, centerDiff,
+            btnW: b.width, btnTop: b.top, refTop: refRect.top
+        });
         btn.remove();
         return false;
     }
@@ -1400,16 +1442,23 @@
     }
 
     /**
-     * 浮层方式：不参与 Google 布局，位置跟随复制按钮
+     * 同行浮层：按钮不参与 Google 的布局（不会被挤到下一行、不会被压扁），
+     * 但位置放在「同一排最右侧图标」的右边、垂直居中，视觉上与工具栏处于同一行。
+     * 旧实现用 anchor.bottom + 4 定位，等于把按钮放到了下一行，正是本次要修的现象。
      */
     function placeButtonOverlay(anchor, btn) {
         btn.style.cssText = OVERLAY_BTN_CSS;
+        btn.dataset.zmPlace = 'overlay';
         document.body.appendChild(btn);
 
+        let raf = 0;
+        let loopTimer = 0;
+        let alive = true;
+
         const reposition = () => {
+            if (!alive) return;
             if (!document.body.contains(anchor) || !document.body.contains(btn)) {
-                window.removeEventListener('scroll', schedule, true);
-                window.removeEventListener('resize', schedule, true);
+                stop();
                 return;
             }
             const r = anchor.getBoundingClientRect();
@@ -1418,22 +1467,53 @@
                 return;
             }
             btn.style.visibility = 'visible';
-            btn.style.left = Math.round(r.left) + 'px';
-            btn.style.top = Math.round(r.bottom + 4) + 'px';
+
+            // 水平基准：这一排最右边的图标（通常是 ⋮ 更多）
+            let rightEdge = r.right;
+            const found = findToolbarRow(anchor);
+            if (found) {
+                found.icons.forEach(icon => {
+                    const ir = icon.getBoundingClientRect();
+                    if (ir.width && ir.height && ir.right > rightEdge) rightEdge = ir.right;
+                });
+            }
+
+            const bw = btn.offsetWidth || 90;
+            const bh = btn.offsetHeight || 22;
+            const maxLeft = window.innerWidth - bw - 8;
+            const left = Math.min(rightEdge + 8, Math.max(8, maxLeft));
+            const top = Math.max(0, r.top + (r.height - bh) / 2);
+
+            btn.style.left = Math.round(left) + 'px';
+            btn.style.top = Math.round(top) + 'px';
         };
 
-        let raf = 0;
         const schedule = () => {
-            if (raf) return;
-            raf = requestAnimationFrame(() => {
-                raf = 0;
-                reposition();
-            });
+            if (raf || !alive) return;
+            raf = requestAnimationFrame(() => { raf = 0; reposition(); });
+        };
+
+        const stop = () => {
+            alive = false;
+            clearTimeout(loopTimer);
+            window.removeEventListener('scroll', schedule, true);
+            window.removeEventListener('resize', schedule, true);
         };
 
         window.addEventListener('scroll', schedule, true);
         window.addEventListener('resize', schedule, true);
         reposition();
+
+        // 低频自循环：覆盖流式输出 / 异步重排导致的工具栏位移（仅按钮存活时运行）
+        const loop = () => {
+            if (!alive) return;
+            schedule();
+            loopTimer = setTimeout(loop, 800);
+        };
+        loopTimer = setTimeout(loop, 800);
+
+        // 供 injectAIModeButtons 每次重扫时主动刷新位置
+        btn.__zmReposition = schedule;
     }
 
     function injectAIModeButtons() {
@@ -1454,25 +1534,33 @@
             // 浮层按钮已挂在 body 上，改用“是否已存在绑定该回答的按钮”判断
             const exist = Array.from(document.querySelectorAll('.ai-zenmark-btn'))
                 .find(b => b.__zmAnswer === info.answer.container);
-            if (exist) return;
+            if (exist) {
+                // 页面重排时顺带刷新浮层位置，避免按钮与工具栏错位
+                if (typeof exist.__zmReposition === 'function') exist.__zmReposition();
+                return;
+            }
             const anchor = info.copy.best || info.buttons[info.buttons.length - 1];
 
             // 主按钮：优先“复制文字”（只要回答），没有则用整轮复制
             const btn = createZenMarkBtn(function (b) {
                 copyAIMode(b, info, true);
             });
+            // icon-button 是 Kimi 站点用的类名，Google 页面不需要，留着可能被同名样式污染
+            btn.classList.remove('icon-button');
             btn.__zmAnswer = info.answer.container;
             btn.title = info.copy.text
                 ? '发送到 ZenMark（只发送回答）'
                 : (info.copy.turn ? '发送到 ZenMark（使用 Google 复制本条回答）' : '发送到 ZenMark（自动转换为 Markdown）');
 
-            // 优先放回工具栏同一行；失败则退回浮层
+            btn.__zmAnchor = anchor;
+            // 优先放回工具栏同一行；失败则退回「同行浮层」（仍在同一水平线）
             placeButton(anchor, btn);
         });
     }
 
     /**
-     * 诊断：控制台执行 __zenmarkAIDiag()
+     * 状态查询：控制台执行 __zenmarkStatus()
+     * placements 里 place=inline / overlay 分别表示行内插入与同行浮层。
      */
     window.__zenmarkStatus = function() {
         const host = window.location.hostname;
@@ -1487,10 +1575,41 @@
             site: site,
             url: window.location.href,
             injectedButtons: document.querySelectorAll('.ai-zenmark-btn').length,
+            placements: Array.from(document.querySelectorAll('.ai-zenmark-btn')).map(b => ({
+                place: b.dataset.zmPlace || 'unknown',
+                top: Math.round(b.getBoundingClientRect().top),
+                left: Math.round(b.getBoundingClientRect().left)
+            })),
             hasGM: typeof GM_xmlhttpRequest === 'function',
             hasUnsafeWindow: typeof unsafeWindow !== 'undefined',
             lastRun: window.__zenmarkLastRun || null
         };
+    };
+
+    /**
+     * 布局诊断：控制台执行 __zenmarkLayoutDiag()
+     * 逐个输出按钮的放置方式，以及它与同一排图标的垂直中心偏差。
+     * sameRow=true 且 place 为 inline/overlay 都表示按钮已与工具栏同排。
+     */
+    window.__zenmarkLayoutDiag = function() {
+        return Array.from(document.querySelectorAll('.ai-zenmark-btn')).map(btn => {
+            const b = btn.getBoundingClientRect();
+            const anchor = btn.__zmAnchor;
+            const found = anchor ? findToolbarRow(anchor) : null;
+            const icons = found ? found.icons : [];
+            const ref = icons.length ? icons[0].getBoundingClientRect() : null;
+            const diff = ref
+                ? Math.abs((b.top + b.height / 2) - (ref.top + ref.height / 2))
+                : null;
+            return {
+                place: btn.dataset.zmPlace || 'unknown',
+                btn: { top: Math.round(b.top), left: Math.round(b.left), w: Math.round(b.width), h: Math.round(b.height) },
+                iconTop: ref ? Math.round(ref.top) : null,
+                iconHeight: ref ? Math.round(ref.height) : null,
+                centerDiff: diff === null ? null : Math.round(diff),
+                sameRow: diff === null ? null : diff <= Math.max(8, ref.height / 2)
+            };
+        });
     };
 
     window.__zenmarkAIDiag = function() {
@@ -1627,6 +1746,7 @@
         host.__zenmarkDiag = window.__zenmarkDiag;
         host.__zenmarkNetTest = window.__zenmarkNetTest;
         host.__zenmarkAIDiag = window.__zenmarkAIDiag;
+        host.__zenmarkLayoutDiag = window.__zenmarkLayoutDiag;
         host.__zenmarkInstances = window.__zenmarkInstances;
         host.__zenmarkShowDiag = showDiagOnPage;
         host.__zenmarkDumpDOM = dumpAIModeDOM;
