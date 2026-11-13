@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.6.1
+// @version      1.7.0
 // @author       Ace & Macro
-// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可在 Google AI 模式按链接总结。
+// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可总结，可在 Google AI 模式与 Google AI Studio 之间切换。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/*
@@ -62,6 +62,27 @@
     ];
 
     const PROVIDER_KEY = 'VIDEO_AI_SUMMARY_PROVIDER';
+
+    // YouTube 总结目标：单独存一个 key，和 B 站的 PROVIDER_KEY 互不干扰
+    const YT_TARGET_KEY = 'VIDEO_AI_SUMMARY_YT_TARGET';
+    const DEFAULT_YT_TARGET_ID = 'ai-mode';
+    const YT_TARGETS = [
+        {
+            id: 'ai-mode',
+            name: 'Google AI 模式',
+            // 完整提示词直接进 q，打开即按提示词运行
+            buildUrl: (prompt) => buildGoogleAiModeUrl(prompt)
+        },
+        {
+            id: 'ai-studio',
+            name: 'Google AI Studio',
+            // 官方 ?prompt= 只预填输入框，用户手动点 Run。
+            // 用 encodeURIComponent 保证空格是 %20 而不是 +，避免页面解析出加号
+            buildUrl: (prompt) =>
+                'https://aistudio.google.com/u/0/prompts/new_chat?pli=1&prompt=' + encodeURIComponent(prompt)
+        }
+    ];
+
     const TASK_TTL = 5 * 60 * 1000; // 待发送内容有效期：5 分钟
     const DEBUG = false;
 
@@ -349,12 +370,25 @@
         try { GM_setValue(PROVIDER_KEY, id); } catch (e) { /* ignore */ }
     }
 
-    function createProviderSelect(currentId, onChange) {
+    function getSelectedYTTarget() {
+        let id = DEFAULT_YT_TARGET_ID;
+        try { id = GM_getValue(YT_TARGET_KEY, DEFAULT_YT_TARGET_ID); } catch (e) { /* ignore */ }
+        return YT_TARGETS.find(target => target.id === id) || YT_TARGETS[0];
+    }
+
+    function setSelectedYTTarget(id) {
+        if (!YT_TARGETS.some(target => target.id === id)) return;
+        try { GM_setValue(YT_TARGET_KEY, id); } catch (e) { /* ignore */ }
+    }
+
+    // options 省略时是 B 站的 6 家模型；传 YT_TARGETS 时是 YouTube 的两种总结目标
+    function createProviderSelect(currentId, onChange, options) {
+        const list = options || PROVIDERS;
         const select = document.createElement('select');
         select.className = 'video-ai-summary-select';
-        select.title = '选择 AI 模型';
+        select.title = options ? '选择总结目标' : '选择 AI 模型';
 
-        PROVIDERS.forEach(provider => {
+        list.forEach(provider => {
             const option = document.createElement('option');
             option.value = provider.id;
             option.textContent = provider.name;
@@ -395,7 +429,8 @@
         return 'https://www.google.com/search?' + params.toString();
     }
 
-    function openGoogleTab(url) {
+    // 通用「新开总结标签页」封装（AI 模式和 AI Studio 共用）
+    function openSummaryTab(url) {
         try {
             if (typeof GM_openInTab === 'function') {
                 GM_openInTab(url, { active: true, insert: true });
@@ -435,20 +470,24 @@
     }
 
     // YouTube 统一入口：播放页按钮和列表卡片按钮都走这里，videoUrl 由调用方显式传入
-    async function sendToGoogleAiMode(videoUrl) {
+    async function sendYouTubeSummary(videoUrl) {
         if (!videoUrl) throw new Error('没有拿到视频链接');
 
+        const target = getSelectedYTTarget();
         const prompt = LINK_SUMMARY_PROMPT.replace(/{{URL}}/g, videoUrl);
-        queueGoogleTask(videoUrl, prompt);
+
+        // AI 模式：完整提示词已随 q 送达，这里只存一份兜底任务（Google 页截断时修补用）
+        // AI Studio：纯 URL 预填，不需要任务字典
+        if (target.id === 'ai-mode') queueGoogleTask(videoUrl, prompt);
 
         try {
             if (typeof GM_setClipboard === 'function') GM_setClipboard(prompt, 'text');
         } catch (e) { /* ignore */ }
 
-        const url = buildGoogleAiModeUrl(prompt);
+        const url = target.buildUrl(prompt);
         await sleep(120);
-        openGoogleTab(url);
-        console.info('[视频AI] 已打开 Google AI 模式:', videoUrl);
+        openSummaryTab(url);
+        console.info('[视频AI] 已打开 ' + target.name + ':', videoUrl);
     }
 
     // ================================================================
@@ -1241,6 +1280,7 @@
             }
             .video-ai-summary-select:hover { border-color: #00a1d6; }
             .video-ai-summary-select option { color: #000; background: #fff; }
+            #yt-ai-summary-select { max-width: 150px; }
 
             #yt-ai-summary-wrap {
                 position: absolute;
@@ -1412,7 +1452,14 @@
     // ================================================================
     let ytWrap = null;
     let ytButton = null;
+    let ytTargetSelect = null;
     let ytRunning = false;
+
+    // 列表悬浮按钮状态提前声明：runYouTube 初始化时 syncYouTubeTargetLabels 会访问它们
+    let ytCardButton = null;
+    let ytActiveCard = null;
+    let ytActiveVideoUrl = '';
+    let ytCardBusy = false;
 
     function runYouTube() {
         // 修复 YouTube Trusted Types
@@ -1435,16 +1482,23 @@
             ytButton = document.createElement('button');
             ytButton.id = 'yt-ai-summary-btn';
             ytButton.type = 'button';
-            ytButton.textContent = '✨ AI 总结';
-            ytButton.title = '在 Google AI 模式里总结当前视频（按链接）';
             ytButton.addEventListener('click', (event) => {
                 event.preventDefault();
                 event.stopPropagation();
                 onYouTubeClick(location.href.split('#')[0]);
             });
 
-            // YouTube 统一走 Google AI 模式，所以不挂模型下拉框
+            // 总结目标下拉：播放页切换一次，GM 持久化，列表悬浮按钮跟着变
+            ytTargetSelect = createProviderSelect(getSelectedYTTarget().id, (id) => {
+                setSelectedYTTarget(id);
+                syncYouTubeTargetLabels();
+                console.info('[视频AI] 已切换总结目标:', getSelectedYTTarget().name);
+            }, YT_TARGETS);
+            ytTargetSelect.id = 'yt-ai-summary-select';
+
             ytWrap.appendChild(ytButton);
+            ytWrap.appendChild(ytTargetSelect);
+            syncYouTubeTargetLabels();
         }
 
         async function onYouTubeClick(videoUrl) {
@@ -1454,7 +1508,7 @@
 
             try {
                 // 播放页按钮作用于当前正在播放的视频，列表卡片按钮传卡片自己的链接
-                await sendToGoogleAiMode(videoUrl || location.href.split('#')[0]);
+                await sendYouTubeSummary(videoUrl || location.href.split('#')[0]);
 
                 setYouTubeButtonState('done');
                 setTimeout(() => setYouTubeButtonState('idle'), 2500);
@@ -1468,15 +1522,16 @@
 
         function setYouTubeButtonState(state) {
             if (!ytButton) return;
+            const isStudio = getSelectedYTTarget().id === 'ai-studio';
             if (state === 'loading') {
                 ytButton.disabled = true;
-                ytButton.textContent = '⏳ 打开 AI 模式...';
+                ytButton.textContent = isStudio ? '⏳ 预填到 Studio...' : '⏳ 打开 AI 模式...';
             } else if (state === 'done') {
                 ytButton.disabled = true;
-                ytButton.textContent = '✅ 已打开新标签页';
+                ytButton.textContent = isStudio ? '✅ 已预填，请点 Run' : '✅ 已打开新标签页';
             } else {
                 ytButton.disabled = false;
-                ytButton.textContent = '✨ AI 总结';
+                ytButton.textContent = isStudio ? '✨ Studio 总结' : '✨ AI 总结';
             }
         }
 
@@ -1493,6 +1548,15 @@
             if (!ytWrap) createWrap();
 
             if (!player.contains(ytWrap)) player.appendChild(ytWrap);
+
+            // 其他标签页改了总结目标时，顺手同步下拉框和按钮文案（用户正在操作时不打断）
+            if (ytTargetSelect && document.activeElement !== ytTargetSelect) {
+                const selectedId = getSelectedYTTarget().id;
+                if (ytTargetSelect.value !== selectedId) {
+                    ytTargetSelect.value = selectedId;
+                    syncYouTubeTargetLabels();
+                }
+            }
 
             // 清理旧脚本/旧版本可能残留的内容，避免重复按钮或残留的下拉框
             document.querySelectorAll('#yt-ai-summary-btn, #yt-ai-summary-select').forEach(el => {
@@ -1531,10 +1595,24 @@
         'yt-image'
     ].join(', ');
 
-    let ytCardButton = null;
-    let ytActiveCard = null;
-    let ytActiveVideoUrl = '';
-    let ytCardBusy = false;
+    // 按钮状态变量已在 YouTube 区块顶部统一声明
+
+    // 目标切换 / 状态复位时，把播放页按钮和列表悬浮按钮的文案一起同步
+    function syncYouTubeTargetLabels() {
+        const isStudio = getSelectedYTTarget().id === 'ai-studio';
+        const label = isStudio ? '✨ Studio 总结' : '✨ AI 总结';
+        const studioHint = '预填到 Google AI Studio：需手动开启 Grounding 并点 Run';
+
+        // 点击进行中不要覆盖「已打开 / 失败」这类临时状态
+        if (ytButton && !ytRunning) {
+            ytButton.textContent = label;
+            ytButton.title = isStudio ? studioHint : '在 Google AI 模式里总结当前视频（按链接）';
+        }
+        if (ytCardButton && !ytCardBusy) {
+            ytCardButton.textContent = label;
+            ytCardButton.title = isStudio ? studioHint : '在 Google AI 模式里总结这个视频（按链接）';
+        }
+    }
 
     // 只要干净的 watch 链接：去掉 list / t / index / si 等参数
     function cleanYouTubeVideoUrl(raw) {
@@ -1582,9 +1660,8 @@
         ytCardButton.id = 'yt-ai-card-summary-btn';
         ytCardButton.type = 'button';
         ytCardButton.dataset.videoAiCardBtn = '1';
-        ytCardButton.textContent = '✨ AI 总结';
-        ytCardButton.title = '在 Google AI 模式里总结这个视频（按链接）';
         (document.body || document.documentElement).appendChild(ytCardButton);
+        syncYouTubeTargetLabels();
 
         ytCardButton.addEventListener('click', onYouTubeCardButtonClick);
         document.addEventListener('mouseover', onYouTubeCardMouseOver);
@@ -1684,8 +1761,10 @@
         ytCardButton.textContent = '⏳ 打开 AI 模式...';
 
         try {
-            await sendToGoogleAiMode(ytActiveVideoUrl);
-            ytCardButton.textContent = '✅ 已打开新标签页';
+            await sendYouTubeSummary(ytActiveVideoUrl);
+            ytCardButton.textContent = getSelectedYTTarget().id === 'ai-studio'
+                ? '✅ 已预填，请点 Run'
+                : '✅ 已打开新标签页';
             setTimeout(resetYouTubeCardButton, 2500);
         } catch (err) {
             showInfoBar('打开失败：' + ((err && err.message) ? err.message : String(err)), 'error', 5000);
@@ -1698,7 +1777,8 @@
     function resetYouTubeCardButton() {
         if (!ytCardButton) return;
         ytCardButton.disabled = false;
-        ytCardButton.textContent = '✨ AI 总结';
+        ytCardBusy = false; // 失败分支里 finally 还没跑，先复位才能让 sync 生效
+        syncYouTubeTargetLabels();
     }
 
     // ================================================================
