@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         视频 AI 总结 (B站/YouTube → 多模型)
 // @namespace    https://space.bilibili.com/398910090
-// @version      1.7.0
+// @version      1.8.0
 // @author       Ace & Macro
-// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可总结，可在 Google AI 模式与 Google AI Studio 之间切换。
+// @description  B站：抓字幕并在新标签页打开所选 AI（DeepSeek/ChatGPT/Kimi/豆包/千问/元宝）自动总结；YouTube：首页及相关视频列表卡片悬停即可总结，可在 Google AI 模式、Google AI Studio 与 Gemini Gem 之间切换。
 // @match        *://*.bilibili.com/video/*
 // @match        *://*.bilibili.com/bangumi/play/*
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
 // @match        https://www.google.com/search*
+// @match        https://gemini.google.com/*
 // @match        https://chat.deepseek.com/*
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -61,6 +62,13 @@
         'VIDEO_AI_SUMMARY_GOOGLE_QUERY'   // 旧版短查询替换
     ];
 
+    // Gemini Gem 任务队列：{ [videoId]: { prompt, videoUrl, timestamp } }
+    // Gem 内置提示词，所以 prompt 就是干净的 YouTube 链接。
+    // 任务走 GM 字典，URL 上只留一个短视频 ID 做认领标记，避免把长内容塞进地址栏。
+    const GEM_TASKS_KEY = 'VIDEO_AI_SUMMARY_GEM_TASKS';
+    const GEM_TASK_PARAM = 'vai_gem';
+    const GEM_BASE_URL = 'https://gemini.google.com/u/0/gem/df372934aec1';
+
     const PROVIDER_KEY = 'VIDEO_AI_SUMMARY_PROVIDER';
 
     // YouTube 总结目标：单独存一个 key，和 B 站的 PROVIDER_KEY 互不干扰
@@ -80,6 +88,13 @@
             // 用 encodeURIComponent 保证空格是 %20 而不是 +，避免页面解析出加号
             buildUrl: (prompt) =>
                 'https://aistudio.google.com/u/0/prompts/new_chat?pli=1&prompt=' + encodeURIComponent(prompt)
+        },
+        {
+            id: 'gem',
+            name: 'Gemini Gem',
+            // Gem 自带提示词，只把视频链接送过去（不拼 LINK_SUMMARY_PROMPT）
+            linkOnly: true,
+            buildUrl: (videoUrl) => buildGemUrl(videoUrl)
         }
     ];
 
@@ -295,7 +310,38 @@
 - 平实、干净。不用刻意幽默，不用刻意深刻。把事情说清楚就是最好的风格。`;
 
     const HOST = location.hostname;
+    const IS_GEMINI_HOST = /(^|\.)gemini\.google\.com$/.test(HOST);
     let googleAiModeRunning = false;
+    let gemTaskRunning = false;
+
+    // Gemini 是 SPA，加载后可能用 history API 改掉地址栏参数。
+    // 所以在 document-start 就把认领标记读进内存，后面不依赖 location.search。
+    const GEM_TASK_TOKEN = (() => {
+        if (!IS_GEMINI_HOST) return '';
+        try {
+            return new URLSearchParams(location.search).get(GEM_TASK_PARAM) || '';
+        } catch (e) {
+            return '';
+        }
+    })();
+
+    // 复用「等输入框 → 填充 → 找发送按钮/回车」这套通用逻辑，
+    // 只把 Gemini 自己的选择器换掉。
+    const GEM_PROVIDER = {
+        name: 'Gemini Gem',
+        inputSelectors: [
+            'div[contenteditable="true"][role="textbox"]',
+            'textarea[aria-label]',
+            'div[contenteditable="true"]',
+            '.ql-editor[contenteditable="true"]'
+        ],
+        sendSelectors: [
+            'button[aria-label*="Send message"]',
+            'button[aria-label*="Send"]',
+            'button[aria-label*="send"]',
+            'button[aria-label*="发送"]'
+        ]
+    };
 
     // ================================================================
     //  AI 模型页面分支
@@ -320,6 +366,15 @@
     // ================================================================
     if (/(^|\.)youtube\.com$/.test(HOST)) {
         whenDomReady(() => setTimeout(runYouTube, 0));
+    }
+
+    // ================================================================
+    //  Gemini Gem 分支（只处理带本脚本认领标记的 Gem 页）
+    //  gemini.google.com 也匹配 google.com 后缀，所以必须放在 AI 模式分支之前
+    // ================================================================
+    if (IS_GEMINI_HOST) {
+        whenDomReady(() => setTimeout(runGeminiGem, 0));
+        return;
     }
 
     // ================================================================
@@ -381,7 +436,7 @@
         try { GM_setValue(YT_TARGET_KEY, id); } catch (e) { /* ignore */ }
     }
 
-    // options 省略时是 B 站的 6 家模型；传 YT_TARGETS 时是 YouTube 的两种总结目标
+    // options 省略时是 B 站的 6 家模型；传 YT_TARGETS 时是 YouTube 的三个总结目标
     function createProviderSelect(currentId, onChange, options) {
         const list = options || PROVIDERS;
         const select = document.createElement('select');
@@ -469,22 +524,75 @@
         try { GM_setValue(GOOGLE_TASKS_KEY, tasks); } catch (e) { /* ignore */ }
     }
 
+    function getYouTubeVideoId(url) {
+        try { return new URL(url).searchParams.get('v') || ''; } catch (e) { return ''; }
+    }
+
+    // URL 上只带这个短标记，长内容一律走 GM 字典
+    function gemTaskToken(videoUrl) {
+        return getYouTubeVideoId(videoUrl) || videoUrl;
+    }
+
+    function buildGemUrl(videoUrl) {
+        return GEM_BASE_URL + '?' + GEM_TASK_PARAM + '=' + encodeURIComponent(gemTaskToken(videoUrl));
+    }
+
+    function cleanGemTasks(tasks, now) {
+        if (!tasks || typeof tasks !== 'object' || Array.isArray(tasks)) return {};
+        Object.keys(tasks).forEach(key => {
+            const task = tasks[key];
+            if (!task || !task.prompt || now - (Number(task.timestamp) || 0) > TASK_TTL) {
+                delete tasks[key];
+            }
+        });
+        return tasks;
+    }
+
+    function queueGemTask(videoUrl, prompt) {
+        let tasks = {};
+        try { tasks = GM_getValue(GEM_TASKS_KEY, {}); } catch (e) { tasks = {}; }
+        tasks = cleanGemTasks(tasks, Date.now());
+        tasks[gemTaskToken(videoUrl)] = {
+            prompt: prompt,
+            videoUrl: videoUrl,
+            timestamp: Date.now()
+        };
+        try { GM_setValue(GEM_TASKS_KEY, tasks); } catch (e) { /* ignore */ }
+    }
+
+    // 按 URL 标记认领，一次性消费；连开多个 Gem 标签页也不会串
+    function claimGemTask(token) {
+        let tasks = null;
+        try { tasks = GM_getValue(GEM_TASKS_KEY, {}); } catch (e) { return null; }
+        tasks = cleanGemTasks(tasks, Date.now());
+        const hit = tasks[token] || null;
+        if (hit) delete tasks[token];
+        try { GM_setValue(GEM_TASKS_KEY, tasks); } catch (e) { /* ignore */ }
+        return hit;
+    }
+
     // YouTube 统一入口：播放页按钮和列表卡片按钮都走这里，videoUrl 由调用方显式传入
     async function sendYouTubeSummary(videoUrl) {
         if (!videoUrl) throw new Error('没有拿到视频链接');
 
         const target = getSelectedYTTarget();
-        const prompt = LINK_SUMMARY_PROMPT.replace(/{{URL}}/g, videoUrl);
+        // Gem 内置了提示词，只把链接送过去；其余目标仍用完整提示词
+        const payload = target.linkOnly
+            ? videoUrl
+            : LINK_SUMMARY_PROMPT.replace(/{{URL}}/g, videoUrl);
 
         // AI 模式：完整提示词已随 q 送达，这里只存一份兜底任务（Google 页截断时修补用）
         // AI Studio：纯 URL 预填，不需要任务字典
-        if (target.id === 'ai-mode') queueGoogleTask(videoUrl, prompt);
+        // Gemini Gem：Gemini 不认 URL 参数，由页面脚本从 GM 字典认领
+        if (target.id === 'ai-mode') queueGoogleTask(videoUrl, payload);
+        if (target.id === 'gem') queueGemTask(videoUrl, payload);
 
+        // 三个目标都留一份剪贴板兜底；Gem 注入失效时手动粘贴即可
         try {
-            if (typeof GM_setClipboard === 'function') GM_setClipboard(prompt, 'text');
+            if (typeof GM_setClipboard === 'function') GM_setClipboard(payload, 'text');
         } catch (e) { /* ignore */ }
 
-        const url = target.buildUrl(prompt);
+        const url = target.buildUrl(payload);
         await sleep(120);
         openSummaryTab(url);
         console.info('[视频AI] 已打开 ' + target.name + ':', videoUrl);
@@ -1522,16 +1630,16 @@
 
         function setYouTubeButtonState(state) {
             if (!ytButton) return;
-            const isStudio = getSelectedYTTarget().id === 'ai-studio';
+            const ui = getYTTargetUi();
             if (state === 'loading') {
                 ytButton.disabled = true;
-                ytButton.textContent = isStudio ? '⏳ 预填到 Studio...' : '⏳ 打开 AI 模式...';
+                ytButton.textContent = ui.loading;
             } else if (state === 'done') {
                 ytButton.disabled = true;
-                ytButton.textContent = isStudio ? '✅ 已预填，请点 Run' : '✅ 已打开新标签页';
+                ytButton.textContent = ui.done;
             } else {
                 ytButton.disabled = false;
-                ytButton.textContent = isStudio ? '✨ Studio 总结' : '✨ AI 总结';
+                ytButton.textContent = ui.label;
             }
         }
 
@@ -1597,20 +1705,45 @@
 
     // 按钮状态变量已在 YouTube 区块顶部统一声明
 
+    // 三个目标共用的文案表，避免各处重复散落的字符串判断
+    function getYTTargetUi() {
+        const id = getSelectedYTTarget().id;
+        if (id === 'ai-studio') {
+            return {
+                label: '✨ Studio 总结',
+                hint: '预填到 Google AI Studio：需手动开启 Grounding 并点 Run',
+                loading: '⏳ 预填到 Studio...',
+                done: '✅ 已预填，请点 Run'
+            };
+        }
+        if (id === 'gem') {
+            return {
+                label: '✨ Gem 总结',
+                hint: '用 Gemini Gem 总结：只发送视频链接，由 Gem 内置提示词接管',
+                loading: '⏳ 发送到 Gem...',
+                done: '✅ 已发送到 Gem'
+            };
+        }
+        return {
+            label: '✨ AI 总结',
+            hint: '在 Google AI 模式里总结这个视频（按链接）',
+            loading: '⏳ 打开 AI 模式...',
+            done: '✅ 已打开新标签页'
+        };
+    }
+
     // 目标切换 / 状态复位时，把播放页按钮和列表悬浮按钮的文案一起同步
     function syncYouTubeTargetLabels() {
-        const isStudio = getSelectedYTTarget().id === 'ai-studio';
-        const label = isStudio ? '✨ Studio 总结' : '✨ AI 总结';
-        const studioHint = '预填到 Google AI Studio：需手动开启 Grounding 并点 Run';
+        const ui = getYTTargetUi();
 
         // 点击进行中不要覆盖「已打开 / 失败」这类临时状态
         if (ytButton && !ytRunning) {
-            ytButton.textContent = label;
-            ytButton.title = isStudio ? studioHint : '在 Google AI 模式里总结当前视频（按链接）';
+            ytButton.textContent = ui.label;
+            ytButton.title = ui.hint;
         }
         if (ytCardButton && !ytCardBusy) {
-            ytCardButton.textContent = label;
-            ytCardButton.title = isStudio ? studioHint : '在 Google AI 模式里总结这个视频（按链接）';
+            ytCardButton.textContent = ui.label;
+            ytCardButton.title = ui.hint;
         }
     }
 
@@ -1758,13 +1891,11 @@
 
         ytCardBusy = true;
         ytCardButton.disabled = true;
-        ytCardButton.textContent = '⏳ 打开 AI 模式...';
+        ytCardButton.textContent = getYTTargetUi().loading;
 
         try {
             await sendYouTubeSummary(ytActiveVideoUrl);
-            ytCardButton.textContent = getSelectedYTTarget().id === 'ai-studio'
-                ? '✅ 已预填，请点 Run'
-                : '✅ 已打开新标签页';
+            ytCardButton.textContent = getYTTargetUi().done;
             setTimeout(resetYouTubeCardButton, 2500);
         } catch (err) {
             showInfoBar('打开失败：' + ((err && err.message) ? err.message : String(err)), 'error', 5000);
@@ -1779,6 +1910,48 @@
         ytCardButton.disabled = false;
         ytCardBusy = false; // 失败分支里 finally 还没跑，先复位才能让 sync 生效
         syncYouTubeTargetLabels();
+    }
+
+    // ================================================================
+    //  Gemini Gem（消费者版 Gemini 原生不认 ?prompt=，只能由脚本注入）
+    // ================================================================
+    function runGeminiGem() {
+        if (gemTaskRunning) return;
+
+        // 手动打开 Gem（没有本脚本认领标记）时什么都不做，不打扰正常使用
+        if (!GEM_TASK_TOKEN) return;
+
+        const task = claimGemTask(GEM_TASK_TOKEN);
+        if (!task) return;
+
+        gemTaskRunning = true;
+        console.info('[视频AI] Gemini Gem 启动:', task.videoUrl || GEM_TASK_TOKEN);
+
+        waitForProviderInput(GEM_PROVIDER, 25000).then(input => {
+            if (!input) {
+                showGeminiFallbackToast();
+                console.warn('[视频AI] 未找到 Gemini 输入框，链接已复制到剪贴板');
+                return;
+            }
+
+            // 等输入框所在组件挂载稳定再填，避免和 Gemini 自己的自动聚焦打架
+            setTimeout(() => {
+                fillAndSendProvider(GEM_PROVIDER, input, task.prompt);
+            }, 1200);
+        });
+    }
+
+    // 注入失败时给一条可见提示：链接已在剪贴板，手动粘贴即可
+    function showGeminiFallbackToast() {
+        try {
+            const box = document.createElement('div');
+            box.textContent = '视频链接已复制到剪贴板，请在输入框按 Ctrl/⌘+V 粘贴后发送';
+            box.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);' +
+                'z-index:2147483647;background:#1a73e8;color:#fff;padding:10px 16px;' +
+                'border-radius:8px;font:14px/1.4 sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.25);';
+            (document.body || document.documentElement).appendChild(box);
+            setTimeout(() => { if (box.parentNode) box.remove(); }, 8000);
+        } catch (e) { /* ignore */ }
     }
 
     // ================================================================
